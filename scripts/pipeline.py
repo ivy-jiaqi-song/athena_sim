@@ -28,7 +28,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     with config_path.open("rb") as stream:
         cfg = tomllib.load(stream)
     cfg["_config_path"] = str(config_path)
-    for section in ("paths", "execution", "build", "simulation", "forcing", "output"):
+    for section in ("paths", "execution", "build", "simulation", "forcing", "output", "selection"):
         if section not in cfg:
             raise ValueError(f"Missing [{section}] in {config_path}")
     return cfg
@@ -199,6 +199,7 @@ def build(cfg: dict[str, Any], clean: bool = False) -> Path:
 def validate_simulation_config(cfg: dict[str, Any]) -> None:
     sim = cfg["simulation"]
     forcing = cfg["forcing"]
+    selection = cfg["selection"]
     n = int(sim["resolution"])
     mb = int(sim["meshblock"])
     if n <= 0 or mb <= 0 or n % mb:
@@ -209,6 +210,11 @@ def validate_simulation_config(cfg: dict[str, Any]) -> None:
         raise ValueError("simulation.guide_field must contain three components")
     if not 0.0 <= float(forcing["solenoidal_fraction"]) <= 1.0:
         raise ValueError("forcing.solenoidal_fraction must be in [0, 1]")
+    if str(selection.get("metric", "")).lower() not in ("ms", "ma"):
+        raise ValueError("selection.metric must be 'ms' or 'ma'")
+    target = float(selection["target"])
+    if not math.isfinite(target) or target <= 0.0:
+        raise ValueError("selection.target must be a positive finite number")
 
 
 def render_athinput(cfg: dict[str, Any], run_name: str | None = None,
@@ -365,7 +371,7 @@ def _read_block(handle: Any, mapping: dict[str, tuple[str, int]], name: str,
     return handle[dataset][index, block, ...]
 
 
-def snapshot_diagnostics(path: Path, sound_speed: float, target_ma: float) -> dict[str, Any]:
+def snapshot_diagnostics(path: Path, sound_speed: float) -> dict[str, Any]:
     import h5py
     import numpy as np
 
@@ -437,8 +443,6 @@ def snapshot_diagnostics(path: Path, sound_speed: float, target_ma: float) -> di
             "alfven_speed_mean_field": alfven_speed,
             "alfvenic_mach_velocity": ma_velocity,
             "alfvenic_mach_magnetic": ma_magnetic,
-            "target_alfvenic_mach": target_ma,
-            "target_ma_fractional_error": (ma_velocity - target_ma) / target_ma,
             "kinetic_energy_density": 0.5 * mean_rho * turbulent_v2,
             "magnetic_energy_density": magnetic_energy,
             "magnetic_fluctuation_energy_density": 0.5 * delta_b_rms**2,
@@ -571,6 +575,12 @@ def saturation_diagnostic(history: dict[str, list[float]], minimum_time: float) 
     import numpy as np
 
     time = np.asarray(history.get("time", []), dtype=float)
+    energy_names = tuple(f"{axis}-{kind}" for kind in ("KE", "ME") for axis in (1, 2, 3))
+    missing = [name for name in energy_names if name not in history]
+    if missing:
+        return {"saturated": None, "reason": f"missing history columns: {', '.join(missing)}"}
+    if any(len(history[name]) != time.size for name in energy_names):
+        return {"saturated": None, "reason": "history energy columns have inconsistent lengths"}
     kinetic = sum((np.asarray(history.get(f"{i}-KE", []), dtype=float) for i in (1, 2, 3)),
                   start=np.zeros_like(time))
     magnetic = sum((np.asarray(history.get(f"{i}-ME", []), dtype=float) for i in (1, 2, 3)),
@@ -594,8 +604,93 @@ def saturation_diagnostic(history: dict[str, list[float]], minimum_time: float) 
     return {
         "saturated": relative_change < 0.10,
         "criterion": "<10% fitted turbulent-energy change over the final 25% of samples",
+        "window_start_time": float(x[0]),
+        "window_end_time": float(x[-1]),
+        "window_sample_count": int(x.size),
         "relative_change_final_quarter": relative_change,
         "fitted_slope": slope,
+    }
+
+
+def select_target_snapshot(
+    diagnostics: list[dict[str, Any]],
+    saturation: dict[str, Any],
+    selection_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    if saturation.get("saturated") is not True:
+        reason = saturation.get("reason", "energy stationarity criterion was not met")
+        raise RuntimeError(f"Cannot select a target snapshot: saturation is unconfirmed ({reason})")
+
+    metric = str(selection_cfg.get("metric", "")).lower()
+    diagnostic_key = {"ms": "sonic_mach", "ma": "alfvenic_mach_magnetic"}.get(metric)
+    if diagnostic_key is None:
+        raise ValueError("selection.metric must be 'ms' or 'ma'")
+    target = float(selection_cfg["target"])
+    if not math.isfinite(target) or target <= 0.0:
+        raise ValueError("selection.target must be a positive finite number")
+
+    start = float(saturation["window_start_time"])
+    end = float(saturation["window_end_time"])
+    candidates = [item for item in diagnostics if start <= float(item["time"]) <= end]
+    if not candidates:
+        raise RuntimeError(
+            f"No Athena snapshot falls inside the accepted saturation window [{start:g}, {end:g}]"
+        )
+    selected = min(
+        candidates,
+        key=lambda item: (abs(float(item[diagnostic_key]) - target), -float(item["time"])),
+    )
+    measured = float(selected[diagnostic_key])
+    return {
+        "metric": metric,
+        "diagnostic": diagnostic_key,
+        "target": target,
+        "measured": measured,
+        "absolute_error": abs(measured - target),
+        "fractional_error": (measured - target) / target,
+        "eligible_snapshot_count": len(candidates),
+        "window_start_time": start,
+        "window_end_time": end,
+        "snapshot": selected,
+    }
+
+
+def postprocess_selected_snapshot(
+    cfg: dict[str, Any], run_dir: Path, analysis_dir: Path, selection: dict[str, Any]
+) -> dict[str, str]:
+    snapshot = run_dir / str(selection["snapshot"]["file"])
+    converted_dir = analysis_dir / "selected_snapshot"
+    converted_path = converted_dir / f"{snapshot.stem}.h5"
+    bfield_dir = analysis_dir / "bfield_slices"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+
+    julia_script = ROOT / "scripts" / "ath2h5.jl"
+    bfield_script = ROOT / "scripts" / "make_bfield_slices.py"
+    run_backend(
+        [
+            str(cfg["execution"].get("julia_command", "julia")),
+            f"--project={backend_path(ROOT, cfg)}",
+            backend_path(julia_script, cfg),
+            "--input", backend_path(snapshot, cfg),
+            "--output", backend_path(converted_path, cfg),
+        ],
+        run_dir,
+        cfg,
+    )
+    run_backend(
+        [
+            str(cfg["execution"].get("python_command", "python3")),
+            backend_path(bfield_script, cfg),
+            "--input", backend_path(converted_path, cfg),
+            "--output-dir", backend_path(bfield_dir, cfg),
+            "--quiver-stride", str(int(cfg["output"].get("quiver_stride", 8))),
+        ],
+        run_dir,
+        cfg,
+    )
+    return {
+        "converted_snapshot": str(converted_path),
+        "bfield_slice_directory": str(bfield_dir),
     }
 
 
@@ -649,12 +744,11 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     sim = cfg["simulation"]
     output_cfg = cfg["output"]
     sound_speed = float(sim["sound_speed"])
-    target_ma = float(sim["target_ma"])
 
     diagnostics: list[dict[str, Any]] = []
     for snapshot in snapshots:
         print(f"[pipeline] analyzing {snapshot.name}")
-        diagnostics.append(snapshot_diagnostics(snapshot, sound_speed, target_ma))
+        diagnostics.append(snapshot_diagnostics(snapshot, sound_speed))
         plot_velocity_slice(
             snapshot,
             slice_dir / f"{snapshot.stem}.png",
@@ -675,6 +769,12 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     saturation = plot_energy_history(
         history_files[-1], analysis_dir / "energy_history.png", minimum_saturation_time
     )
+    selection: dict[str, Any] | None = None
+    selection_error: str | None = None
+    try:
+        selection = select_target_snapshot(diagnostics, saturation, cfg["selection"])
+    except (RuntimeError, ValueError) as exc:
+        selection_error = str(exc)
     summary = {
         "run_directory": str(run_dir),
         "configuration": str(cfg["_config_path"]),
@@ -685,10 +785,23 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
             "athena_units": "magnetic permeability is unity, so magnetic energy density is B^2/2",
         },
         "saturation_heuristic": saturation,
+        "target_selection": selection if selection is not None else {
+            "status": "failed",
+            "error": selection_error,
+        },
         "final_snapshot": diagnostics[-1],
         "snapshots": diagnostics,
     }
-    (analysis_dir / "diagnostics.json").write_text(
+    diagnostics_path = analysis_dir / "diagnostics.json"
+    diagnostics_path.write_text(
+        json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    if selection is None:
+        raise RuntimeError(selection_error or "Target snapshot selection failed")
+
+    products = postprocess_selected_snapshot(cfg, run_dir, analysis_dir, selection)
+    summary["target_selection"]["products"] = products
+    diagnostics_path.write_text(
         json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
     )
     print(f"[pipeline] analysis written to {analysis_dir}")

@@ -8,7 +8,7 @@ The supplied problem generator initializes a periodic cube with uniform density,
 
 ## Setup
 
-Requirements are Python 3.11+, NumPy, h5py, Matplotlib, Athena++ source, and a Linux dependency prefix containing a C++ compiler, FFTW, and HDF5. MPI runs additionally require OpenMPI, an MPI compiler, and MPI-enabled FFTW/HDF5.
+Requirements are Python 3.11+, NumPy, h5py, Matplotlib, Julia 1.10+, Athena++ source, and a Linux dependency prefix containing a C++ compiler, FFTW, and HDF5. MPI runs additionally require OpenMPI, an MPI compiler, and MPI-enabled FFTW/HDF5.
 
 Create a machine-local configuration after cloning:
 
@@ -22,6 +22,7 @@ Install the Python dependencies and execute all stages:
 
 ```bash
 python -m pip install -r requirements.txt
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
 python scripts/pipeline.py all --config configs/local.toml --clean --overwrite
 ```
 
@@ -43,6 +44,7 @@ The tracked [example configuration](configs/example.toml) is a 256^3, 16-rank MP
 - `tlim`: simulation duration in code units.
 - `sound_speed`: sets the sonic Mach-number scale for the isothermal build.
 - `guide_field`: mean magnetic field, normally along x1.
+- `selection.metric` and `selection.target`: select the saturated snapshot nearest a requested `ms` or magnetic `ma` value.
 - `energy_injection_rate`: forcing power.
 - `nlow` and `nhigh`: Athena++ drives only modes satisfying `nlow < |k| < nhigh`.
 - `solenoidal_fraction = 1.0`: purely solenoidal driving.
@@ -63,6 +65,8 @@ Each run is written below `output_root/run_name/`:
 - `analysis/energy_history.png`: kinetic, fluctuating magnetic, turbulent, and total magnetic energy histories.
 - `analysis/diagnostics.csv`: scalar diagnostics by snapshot.
 - `analysis/diagnostics.json`: formulas, saturation assessment, $M_s$, two $M_A$ estimators, field statistics, plasma beta, and energies.
+- `analysis/selected_snapshot/*.h5`: the selected saturated snapshot converted to contiguous cubes.
+- `analysis/bfield_slices/*.png`: three orthogonal magnetic slices from the selected snapshot.
 
 The primary definitions are
 
@@ -71,6 +75,8 @@ M_s = \frac{v_{rms,\rho}}{c_s}, \qquad
 M_A = \frac{v_{rms,\rho}}{|\langle B\rangle|/\sqrt{\langle\rho\rangle}}, \qquad
 M_{A,B}=\frac{\delta B_{rms}}{|\langle B\rangle|}.
 \]
+
+The final 25% of usable history samples is the candidate saturation window. The pipeline first requires less than 10% fitted turbulent-energy change across that window. It then considers only `.athdf` snapshots whose stored Athena time is inside the accepted window and minimizes absolute error against the configured target. `metric = "ms"` uses $M_s$; `metric = "ma"` uses $M_{A,B}$. If saturation is false or inconclusive, or if no snapshot is inside the window, analysis records the failure in `diagnostics.json` and exits without conversion or magnetic-slice generation.
 
 Only tune $M_A$ from a run that the saturation diagnostic accepts. A useful next iteration is
 

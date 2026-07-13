@@ -12,6 +12,9 @@ __pycache__/
 .venv/
 venv/
 
+# Resolve Julia artifacts for the platform running the workflow.
+Manifest.toml
+
 # Editor and operating-system files.
 .idea/
 .vscode/

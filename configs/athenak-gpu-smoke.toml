@@ -1,0 +1,68 @@
+[paths]
+athena_source = "unused"
+build_dir = "build/unused"
+athenak_source = "/home/user0001/apps/athenak-main"
+athenak_build_dir = "build/athenak-cuda-smoke"
+output_root = "outputs_gpu/athenak-smoke"
+
+[execution]
+solver = "athenak"
+backend = "linux"
+dependency_prefix = "/usr/local/cuda-12.8"
+threads = 2
+mpi_ranks = 1
+mpi_compiler = "mpicxx"
+mpi_launcher = "mpirun"
+julia_command = "julia"
+python_command = "python3"
+
+[build]
+eos = "isothermal"
+openmp = false
+mpi = false
+single_precision = false
+
+[athenak]
+# The remote source was provided as a zip archive, not a Git checkout.
+revision = ""
+device = "cuda"
+kokkos_arch = "BLACKWELL120"
+integrator = "rk2"
+reconstruction = "plm"
+nlow = 2
+nhigh = 3
+
+[simulation]
+run_name = "athenak_cuda_smoke_n16"
+resolution = 16
+meshblock = 8
+box_length = 1.0
+tlim = 0.03
+cfl = 0.30
+rho0 = 1.0
+sound_speed = 0.75
+pressure0 = 0.5625
+guide_field = [1.07, 0.1, -0.05]
+
+[selection]
+metric = "ms"
+target = 1.0
+
+[forcing]
+mode = 2
+energy_injection_rate = 1.0
+nlow = 1
+nhigh = 4
+spectrum_exponent = 2.0
+correlation_time = 0.01
+drive_interval = 0.002
+solenoidal_fraction = 1.0
+random_seed = 12345
+
+[output]
+history_interval = 0.005
+snapshot_interval = 0.01
+restart_interval = 1.0
+slice_axis = "x3"
+slice_index = -1
+quiver_stride = 4

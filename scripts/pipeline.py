@@ -96,7 +96,9 @@ def run_backend(
     }
     if prefix:
         env_updates["PATH"] = f"{prefix}/bin:$PATH"
-        env_updates["LD_LIBRARY_PATH"] = f"{prefix}/lib:${{LD_LIBRARY_PATH:-}}"
+        env_updates["LD_LIBRARY_PATH"] = (
+            f"{prefix}/lib64:{prefix}/lib:${{LD_LIBRARY_PATH:-}}"
+        )
 
     print(f"[pipeline] cwd: {cwd}")
     print("[pipeline] command:", " ".join(shlex.quote(item) for item in command))
@@ -131,7 +133,7 @@ def run_backend(
             if prefix:
                 env["PATH"] = f"{prefix}/bin:{os.environ.get('PATH', '')}"
                 old_ld = os.environ.get("LD_LIBRARY_PATH", "")
-                env["LD_LIBRARY_PATH"] = f"{prefix}/lib:{old_ld}"
+                env["LD_LIBRARY_PATH"] = f"{prefix}/lib64:{prefix}/lib:{old_ld}"
             subprocess.run(command, check=True, cwd=cwd, env=env, stdout=output,
                            stderr=subprocess.STDOUT if output else None)
     finally:
@@ -253,24 +255,25 @@ def _validate_recursive_checkout(source: Path) -> None:
 
 def prepare_athenak_build_tree(cfg: dict[str, Any], clean: bool) -> tuple[Path, Path]:
     external_source = project_path(cfg["paths"]["athenak_source"])
-    expected_revision = str(cfg["athenak"].get("revision", ATHENAK_REVISION))
+    expected_revision = str(cfg["athenak"].get("revision", ATHENAK_REVISION)).strip()
     if not (external_source / "CMakeLists.txt").is_file():
         raise FileNotFoundError(f"AthenaK source not found at {external_source}")
-    actual_revision = _git_revision(external_source)
-    if actual_revision != expected_revision:
-        raise ValueError(
-            f"AthenaK source revision is {actual_revision}; expected {expected_revision}"
-        )
     if not (external_source / "kokkos" / "CMakeLists.txt").is_file():
         raise FileNotFoundError("AthenaK Kokkos submodule is missing; update submodules recursively")
-    _validate_recursive_checkout(external_source)
+    if expected_revision:
+        actual_revision = _git_revision(external_source)
+        if actual_revision != expected_revision:
+            raise ValueError(
+                f"AthenaK source revision is {actual_revision}; expected {expected_revision}"
+            )
+        _validate_recursive_checkout(external_source)
 
     root, source_copy, cmake_build = athenak_tree_paths(cfg)
     if clean and root.exists():
         shutil.rmtree(root)
     if not source_copy.exists():
         root.mkdir(parents=True, exist_ok=True)
-        print(f"[pipeline] copying pinned AthenaK source to {source_copy}")
+        print(f"[pipeline] copying AthenaK source to {source_copy}")
         shutil.copytree(
             external_source,
             source_copy,
@@ -361,8 +364,9 @@ def validate_simulation_config(cfg: dict[str, Any]) -> None:
             if key not in cfg["paths"]:
                 raise ValueError(f"paths.{key} is required for the AthenaK solver")
         ak = cfg["athenak"]
-        if str(ak.get("revision", "")) != ATHENAK_REVISION:
-            raise ValueError(f"athenak.revision must be pinned to {ATHENAK_REVISION}")
+        revision = str(ak.get("revision", "")).strip()
+        if revision and revision != ATHENAK_REVISION:
+            raise ValueError(f"athenak.revision must be empty or pinned to {ATHENAK_REVISION}")
         if str(ak.get("device", "cpu")).lower() not in ("cpu", "cuda"):
             raise ValueError("athenak.device must be 'cpu' or 'cuda'")
         if str(ak.get("device", "cpu")).lower() == "cuda" and not str(ak.get("kokkos_arch", "")).strip():

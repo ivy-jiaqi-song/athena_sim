@@ -1,6 +1,7 @@
 # Per-machine configuration. Start from configs/example.toml.
 configs/*.toml
 !configs/example.toml
+!configs/athenak-gpu-smoke.toml
 
 # Disposable Athena++ build and simulation products.
 build/

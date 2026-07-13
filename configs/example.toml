@@ -1,0 +1,62 @@
+# Example 256^3 driven MHD turbulence configuration with M_s > 1.
+# Copy this file to local.toml and update all machine-specific paths and resources.
+# The dependency environment must provide OpenMPI and MPI-enabled FFTW/HDF5.
+# 256^3 with meshblock=32 -> 512 MeshBlocks; 16 ranks -> 32 blocks/rank.
+#
+# sound_speed=0.75 targets M_s around 1.3 while guide_field=1.07 targets M_A around 0.9.
+
+[paths]
+athena_source = "/home/user0001/apps/athena-main"
+build_dir = "build/athena"
+output_root = "outputs"
+
+[execution]
+backend = "linux"
+dependency_prefix = "/home/user0001/.conda/envs/athena-build"
+threads = 1
+mpi_ranks = 16
+mpi_compiler = "mpicxx"
+mpi_launcher = "mpirun"
+
+[build]
+eos = "isothermal"
+openmp = false
+mpi = true
+single_precision = false
+
+[simulation]
+run_name = "mhd_256_ms_gt1"
+resolution = 256
+meshblock = 32
+box_length = 1.0
+tlim = 2.0
+cfl = 0.30
+integrator = "vl2"
+reconstruction_order = 2
+rho0 = 1.0
+# Lowered from 1.0 to 0.75 to push M_s above 1 (target ~1.3 at 256^3).
+sound_speed = 0.75
+pressure0 = 0.6
+# Iteration 2 of the mhd_256_ma09 lineage kept B0=1.07 (M_A ~0.93); unchanged here.
+guide_field = [1.07, 0.0, 0.0]
+target_ma = 0.9
+
+[forcing]
+mode = 2
+energy_injection_rate = 1.0
+# Athena++ drives modes with nlow < |k| < nhigh; shells 2-3 give L_inj ~ 0.4 Lbox.
+nlow = 1
+nhigh = 4
+spectrum_exponent = 2.0
+correlation_time = 0.10
+drive_interval = 0.02
+solenoidal_fraction = 1.0
+random_seed = 12345
+
+[output]
+history_interval = 0.05
+snapshot_interval = 0.25
+restart_interval = 1.0
+slice_axis = "x3"
+slice_index = -1
+quiver_stride = 8

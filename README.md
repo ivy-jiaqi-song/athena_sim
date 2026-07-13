@@ -1,12 +1,10 @@
 # Athena++ driven MHD turbulence
 
-This workspace generates statistically driven, three-dimensional, compressible MHD turbulence for later test-particle and pitch-angle-diffusion work. It copies an external Athena++ source tree into a disposable local build, installs the custom problem generator, runs Athena++, and analyzes every HDF5 snapshot.
+This repository is a configurable driver for three-dimensional, compressible MHD turbulence simulations with Athena++. It copies an external Athena++ source tree into a disposable local build, installs the custom problem generator, runs the simulation, and analyzes every HDF5 snapshot.
 
-## What matches the paper
+## Simulation
 
-The setup uses a periodic cube, a uniform guide field, compressible MHD, solenoidal forcing, and forcing shells centered near $kL_{box}/2\pi \approx 2.5$, corresponding to $L_{inj}\approx0.4L_{box}$. The paper's nominal grid is $512^3$.
-
-This is a comparable setup, not an exact reproduction. Maiti et al. used a Cho-Lazarian-based solver and PENCIL, not Athena++, and did not report enough EOS/forcing details to recreate its turbulence uniquely. Table 1 gives $M_A=0.83$ for the nearest whole-turbulence cube and $M_A=0.91$ for a decomposed-mode cube.
+The supplied problem generator initializes a periodic cube with uniform density, zero velocity, and a divergence-free uniform magnetic guide field. Athena++ then drives compressible turbulence over configurable Fourier modes with a configurable mixture of solenoidal and compressive forcing.
 
 ## Setup
 
@@ -64,7 +62,7 @@ Each run is written below `output_root/run_name/`:
 - `analysis/velocity_slices/*.png`: velocity magnitude plus in-plane arrows for every snapshot.
 - `analysis/energy_history.png`: kinetic, fluctuating magnetic, turbulent, and total magnetic energy histories.
 - `analysis/diagnostics.csv`: scalar diagnostics by snapshot.
-- `analysis/diagnostics.json`: formulas, paper-comparison metadata, saturation assessment, $M_s$, two $M_A$ estimators, field statistics, plasma beta, and energies.
+- `analysis/diagnostics.json`: formulas, saturation assessment, $M_s$, two $M_A$ estimators, field statistics, plasma beta, and energies.
 
 The primary definitions are
 

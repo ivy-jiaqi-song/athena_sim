@@ -230,7 +230,6 @@ def render_athinput(cfg: dict[str, Any], run_name: str | None = None,
 
     return f"""<comment>
 problem = Homogeneous, driven, compressible MHD turbulence
-paper   = Maiti et al. 2022, arXiv:2108.01936 (comparable setup, not exact reproduction)
 
 <job>
 problem_id = {name}
@@ -679,12 +678,6 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     summary = {
         "run_directory": str(run_dir),
         "configuration": str(cfg["_config_path"]),
-        "paper_comparison": {
-            "resolution": "paper uses 512^3",
-            "boundary_conditions": "periodic",
-            "forcing": "solenoidal; L_inj approximately 0.4 L_box",
-            "solver_note": "paper used Cho-Lazarian-based and PENCIL codes, not Athena++",
-        },
         "definitions": {
             "sonic_mach": "density-weighted turbulent v_rms / isothermal sound speed",
             "alfvenic_mach_velocity": "density-weighted turbulent v_rms / (|<B>|/sqrt(<rho>))",

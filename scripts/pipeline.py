@@ -31,7 +31,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     with config_path.open("rb") as stream:
         cfg = tomllib.load(stream)
     cfg["_config_path"] = str(config_path)
-    for section in ("paths", "execution", "build", "simulation", "forcing", "output", "selection"):
+    for section in ("paths", "execution", "build", "simulation", "harris_sheet", "output"):
         if section not in cfg:
             raise ValueError(f"Missing [{section}] in {config_path}")
     cfg["execution"].setdefault("solver", "athena++")
@@ -344,23 +344,21 @@ def build(cfg: dict[str, Any], clean: bool = False) -> Path:
 def validate_simulation_config(cfg: dict[str, Any]) -> None:
     solver = solver_name(cfg)
     sim = cfg["simulation"]
-    forcing = cfg["forcing"]
-    selection = cfg["selection"]
+    sheet = cfg["harris_sheet"]
     n = int(sim["resolution"])
     mb = int(sim["meshblock"])
     if n <= 0 or mb <= 0 or n % mb:
         raise ValueError("resolution and meshblock must be positive, and resolution % meshblock == 0")
-    if n < 2 * int(forcing["nhigh"]):
-        raise ValueError("resolution must be at least twice forcing.nhigh")
-    if len(sim["guide_field"]) != 3:
-        raise ValueError("simulation.guide_field must contain three components")
-    if not 0.0 <= float(forcing["solenoidal_fraction"]) <= 1.0:
-        raise ValueError("forcing.solenoidal_fraction must be in [0, 1]")
-    if str(selection.get("metric", "")).lower() not in ("ms", "ma"):
-        raise ValueError("selection.metric must be 'ms' or 'ma'")
-    target = float(selection["target"])
-    if not math.isfinite(target) or target <= 0.0:
-        raise ValueError("selection.target must be a positive finite number")
+    for key in ("b0", "sheet_width", "noise_amplitude"):
+        value = float(sheet[key])
+        if not math.isfinite(value):
+            raise ValueError(f"harris_sheet.{key} must be finite")
+    if float(sheet["b0"]) <= 0.0:
+        raise ValueError("harris_sheet.b0 must be positive")
+    if float(sheet["sheet_width"]) <= 0.0:
+        raise ValueError("harris_sheet.sheet_width must be positive")
+    if float(sim["sound_speed"]) <= 0.0 or float(sim["rho0"]) <= 0.0:
+        raise ValueError("simulation.sound_speed and simulation.rho0 must be positive")
     if solver == "athenak":
         if "athenak" not in cfg:
             raise ValueError("Missing [athenak] for the AthenaK solver")
@@ -379,31 +377,34 @@ def validate_simulation_config(cfg: dict[str, Any]) -> None:
             raise ValueError("This workflow requires athenak.integrator = 'rk2'")
         if str(ak.get("reconstruction", "plm")) != "plm":
             raise ValueError("This workflow requires athenak.reconstruction = 'plm'")
-        if (int(ak.get("nlow", 2)), int(ak.get("nhigh", 3))) != (2, 3):
-            raise ValueError("AthenaK shell mapping must use athenak.nlow=2 and athenak.nhigh=3")
-        if not math.isclose(float(forcing["solenoidal_fraction"]), 1.0, abs_tol=1.0e-12):
-            raise ValueError("AthenaK supports only solenoidal_fraction = 1.0")
+        particles = cfg.get("particles", {})
+        if particles.get("enabled", False):
+            if str(ak.get("device", "cpu")).lower() != "cuda":
+                raise ValueError("tracked particle sanity checks are only enabled for AthenaK CUDA runs")
+            if int(particles.get("nparticles", 0)) <= 0:
+                raise ValueError("particles.nparticles must be positive when particles.enabled = true")
+            if float(particles.get("injection_radius", 0.0)) < 0.0:
+                raise ValueError("particles.injection_radius must be non-negative")
 
 
 def render_athenapp_input(cfg: dict[str, Any], run_name: str | None = None,
                           guide_field: Iterable[float] | None = None) -> str:
     validate_simulation_config(cfg)
     sim = cfg["simulation"]
-    forcing = cfg["forcing"]
     output = cfg["output"]
     build_cfg = cfg["build"]
+    sheet = cfg["harris_sheet"]
     name = run_name or str(sim["run_name"])
     n = int(sim["resolution"])
     mb = int(sim["meshblock"])
     length = float(sim["box_length"])
     half = 0.5 * length
-    b1, b2, b3 = tuple(guide_field or sim["guide_field"])
     eos = build_cfg.get("eos", "isothermal")
     gamma = float(sim.get("gamma", 5.0 / 3.0))
     sound_speed = float(sim.get("sound_speed", 1.0))
 
     return f"""<comment>
-problem = Homogeneous, driven, compressible MHD turbulence
+problem = Isothermal Harris Sheet MHD test
 
 <job>
 problem_id = {name}
@@ -459,21 +460,12 @@ iso_sound_speed = {sound_speed:.16g}
 <problem>
 rho0 = {float(sim['rho0']):.16g}
 pressure0 = {float(sim.get('pressure0', 1.0)):.16g}
-b1 = {float(b1):.16g}
-b2 = {float(b2):.16g}
-b3 = {float(b3):.16g}
+b0 = {float(sheet['b0']):.16g}
+guide_b3 = {float(sheet.get('guide_b3', 0.0)):.16g}
+sheet_width = {float(sheet['sheet_width']):.16g}
+noise_amplitude = {float(sheet['noise_amplitude']):.16g}
+sound_speed = {sound_speed:.16g}
 eos_label = {eos}
-
-<turbulence>
-turb_flag = {int(forcing['mode'])}
-dedt = {float(forcing['energy_injection_rate']):.16g}
-nlow = {int(forcing['nlow'])}
-nhigh = {int(forcing['nhigh'])}
-expo = {float(forcing['spectrum_exponent']):.16g}
-tcorr = {float(forcing['correlation_time']):.16g}
-dtdrive = {float(forcing['drive_interval']):.16g}
-f_shear = {float(forcing['solenoidal_fraction']):.16g}
-rseed = {int(forcing['random_seed'])}
 """
 
 
@@ -488,16 +480,16 @@ def render_athenak_input(cfg: dict[str, Any], run_name: str | None = None,
                          guide_field: Iterable[float] | None = None) -> str:
     validate_simulation_config(cfg)
     sim = cfg["simulation"]
-    forcing = cfg["forcing"]
     output = cfg["output"]
     ak = cfg["athenak"]
+    sheet = cfg["harris_sheet"]
+    particles = cfg.get("particles", {})
     name = effective_run_name(cfg, run_name)
     n = int(sim["resolution"])
     mb = int(sim["meshblock"])
     half = 0.5 * float(sim["box_length"])
-    b1, b2, b3 = tuple(guide_field or sim["guide_field"])
-    return f"""<comment>
-problem = Homogeneous, driven, compressible isothermal MHD turbulence
+    text = f"""<comment>
+problem = Isothermal Harris Sheet MHD test
 
 <job>
 basename = {name}
@@ -541,18 +533,11 @@ iso_sound_speed = {float(sim['sound_speed']):.16g}
 
 <problem>
 rho0 = {float(sim['rho0']):.16g}
-b1 = {float(b1):.16g}
-b2 = {float(b2):.16g}
-b3 = {float(b3):.16g}
-
-<turb_driving>
-type = mhd
-driving_type = 0
-dedt = {float(forcing['energy_injection_rate']):.16g}
-tcorr = {float(forcing['correlation_time']):.16g}
-expo = {float(forcing['spectrum_exponent']):.16g}
-nlow = {int(ak.get('nlow', 2))}
-nhigh = {int(ak.get('nhigh', 3))}
+b0 = {float(sheet['b0']):.16g}
+guide_b3 = {float(sheet.get('guide_b3', 0.0)):.16g}
+sheet_width = {float(sheet['sheet_width']):.16g}
+noise_amplitude = {float(sheet['noise_amplitude']):.16g}
+sound_speed = {float(sim['sound_speed']):.16g}
 
 <output1>
 file_type = hst
@@ -569,6 +554,32 @@ dt = {float(output['snapshot_interval']):.16g}
 file_type = rst
 dt = {float(output['restart_interval']):.16g}
 """
+    if particles.get("enabled", False):
+        n = int(sim["resolution"])
+        nparticles = int(particles["nparticles"])
+        ppc = nparticles / float(n**3)
+        text += f"""
+<particles>
+particle_type = cosmic_ray
+ppc = {ppc:.16g}
+pusher = drift
+assign_tag = index_order
+injection_radius = {float(particles.get('injection_radius', 0.02)):.16g}
+velocity_scale = {float(particles.get('velocity_scale', 0.0)):.16g}
+
+<output4>
+file_type = trk
+variable = prtcl_all
+dt = {float(particles.get('track_interval', output['history_interval'])):.16g}
+nparticles = {nparticles}
+
+<output5>
+file_type = pvtk
+variable = prtcl_all
+id = prtcl_all
+dt = {float(particles.get('vtk_interval', particles.get('track_interval', output['history_interval']))):.16g}
+"""
+    return text
 
 
 def render_athinput(cfg: dict[str, Any], run_name: str | None = None,
@@ -657,10 +668,8 @@ def run_athenak(cfg: dict[str, Any], overwrite: bool = False,
         "revision": str(cfg["athenak"]["revision"]),
         "device": str(cfg["athenak"].get("device", "cpu")),
         "kokkos_arch": str(cfg["athenak"].get("kokkos_arch", "")),
-        "backend_controls": {
-            "forcing.drive_interval": "not applicable; AthenaK advances OU forcing each timestep",
-            "forcing.random_seed": "not applicable; pinned AthenaK uses its native internal RNG initialization",
-        },
+        "problem": "harris_sheet",
+        "particles": cfg.get("particles", {"enabled": False}),
     }
     (run_dir / "solver_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"[pipeline] simulation log: {log_path}")
@@ -755,8 +764,18 @@ def snapshot_diagnostics(path: Path, sound_speed: float) -> dict[str, Any]:
         sum_b = np.zeros(3, dtype=np.float64)
         sum_b2 = 0.0
         sum_pressure = 0.0
+        sum_b1_upper = 0.0
+        sum_b1_lower = 0.0
+        count_upper = 0
+        count_lower = 0
+        max_abs_j3_proxy = 0.0
         has_pressure = "press" in mapping
         num_blocks = int(handle.attrs["NumMeshBlocks"])
+        logical = np.asarray(handle["LogicalLocations"], dtype=int)
+        root_x2 = np.asarray(handle.attrs["RootGridX2"], dtype=float)
+        block_size = np.asarray(handle.attrs["MeshBlockSize"], dtype=int)
+        root_size = np.asarray(handle.attrs["RootGridSize"], dtype=int)
+        dx2 = (root_x2[1] - root_x2[0]) / int(root_size[1])
         for block in range(num_blocks):
             rho = np.asarray(_read_block(handle, mapping, "rho", block), dtype=np.float64)
             velocity = [
@@ -776,6 +795,19 @@ def snapshot_diagnostics(path: Path, sound_speed: float) -> dict[str, Any]:
                 sum_momentum[component] += float((rho * velocity[component]).sum())
                 sum_b[component] += float(magnetic[component].sum())
             sum_b2 += float(sum(np.square(component) for component in magnetic).sum())
+            j_start = int(logical[block, 1] * block_size[1])
+            y = root_x2[0] + (np.arange(j_start, j_start + block_size[1]) + 0.5) * dx2
+            upper = y >= 0.0
+            lower = ~upper
+            b1 = magnetic[0]
+            if upper.any():
+                sum_b1_upper += float(b1[:, upper, :].sum())
+                count_upper += int(b1[:, upper, :].size)
+            if lower.any():
+                sum_b1_lower += float(b1[:, lower, :].sum())
+                count_lower += int(b1[:, lower, :].size)
+            if b1.shape[1] > 1 and dx2 > 0.0:
+                max_abs_j3_proxy = max(max_abs_j3_proxy, float(np.max(np.abs(np.gradient(b1, dx2, axis=1)))))
             if has_pressure:
                 sum_pressure += float(np.asarray(
                     _read_block(handle, mapping, "press", block), dtype=np.float64
@@ -795,6 +827,8 @@ def snapshot_diagnostics(path: Path, sound_speed: float) -> dict[str, Any]:
         pressure = sum_pressure / count if has_pressure else mean_rho * sound_speed**2
         magnetic_energy = 0.5 * mean_b2
         density_variance = max(0.0, sum_rho2 / count - mean_rho**2)
+        mean_b1_upper = sum_b1_upper / count_upper if count_upper else math.nan
+        mean_b1_lower = sum_b1_lower / count_lower if count_lower else math.nan
 
         return {
             "file": path.name,
@@ -816,6 +850,10 @@ def snapshot_diagnostics(path: Path, sound_speed: float) -> dict[str, Any]:
             "magnetic_fluctuation_energy_density": 0.5 * delta_b_rms**2,
             "mean_gas_pressure": pressure,
             "plasma_beta": pressure / magnetic_energy if magnetic_energy > 0 else math.inf,
+            "mean_b1_upper_half": mean_b1_upper,
+            "mean_b1_lower_half": mean_b1_lower,
+            "harris_reversal_contrast": mean_b1_upper - mean_b1_lower,
+            "max_abs_current_j3_proxy": max_abs_j3_proxy,
         }
 
 
@@ -1023,6 +1061,26 @@ def select_target_snapshot(
     }
 
 
+def select_harris_snapshot(
+    diagnostics: list[dict[str, Any]], output_cfg: dict[str, Any]
+) -> dict[str, Any]:
+    policy = str(output_cfg.get("snapshot_policy", "final")).lower()
+    if policy == "final":
+        selected = diagnostics[-1]
+    elif policy == "peak_kinetic":
+        selected = max(diagnostics, key=lambda item: float(item["kinetic_energy_density"]))
+    elif policy == "peak_current":
+        selected = max(diagnostics, key=lambda item: float(item["max_abs_current_j3_proxy"]))
+    else:
+        raise ValueError("output.snapshot_policy must be 'final', 'peak_kinetic', or 'peak_current'")
+    return {
+        "mode": "harris_sheet",
+        "policy": policy,
+        "snapshot": selected,
+        "eligible_snapshot_count": len(diagnostics),
+    }
+
+
 def postprocess_selected_snapshot(
     cfg: dict[str, Any], run_dir: Path, analysis_dir: Path, selection: dict[str, Any]
 ) -> dict[str, str]:
@@ -1137,14 +1195,13 @@ def analyze_common(cfg: dict[str, Any], run_name: str | None = None) -> Path:
         for item in diagnostics:
             writer.writerow({key: item[key] for key in scalar_keys})
 
-    minimum_saturation_time = 5.0 * float(cfg["forcing"]["correlation_time"])
     saturation = plot_energy_history(
-        history_files[-1], analysis_dir / "energy_history.png", minimum_saturation_time
+        history_files[-1], analysis_dir / "energy_history.png", minimum_saturation_time=0.0
     )
     selection: dict[str, Any] | None = None
     selection_error: str | None = None
     try:
-        selection = select_target_snapshot(diagnostics, saturation, cfg["selection"])
+        selection = select_harris_snapshot(diagnostics, output_cfg)
     except (RuntimeError, ValueError) as exc:
         selection_error = str(exc)
     summary = {
@@ -1156,9 +1213,11 @@ def analyze_common(cfg: dict[str, Any], run_name: str | None = None) -> Path:
             "alfvenic_mach_velocity": "density-weighted turbulent v_rms / (|<B>|/sqrt(<rho>))",
             "alfvenic_mach_magnetic": "rms(B-<B>) / |<B>|",
             "athena_units": "magnetic permeability is unity, so magnetic energy density is B^2/2",
+            "harris_reversal_contrast": "mean B1 in x2>=0 minus mean B1 in x2<0",
+            "max_abs_current_j3_proxy": "max |dB1/dx2| computed block-locally from cell-centered B1",
         },
-        "saturation_heuristic": saturation,
-        "target_selection": selection if selection is not None else {
+        "energy_stationarity_heuristic": saturation,
+        "snapshot_selection": selection if selection is not None else {
             "status": "failed",
             "error": selection_error,
         },
@@ -1173,7 +1232,7 @@ def analyze_common(cfg: dict[str, Any], run_name: str | None = None) -> Path:
         raise RuntimeError(selection_error or "Target snapshot selection failed")
 
     products = postprocess_selected_snapshot(cfg, run_dir, analysis_dir, selection)
-    summary["target_selection"]["products"] = products
+    summary["snapshot_selection"]["products"] = products
     diagnostics_path.write_text(
         json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
     )

@@ -1,0 +1,58 @@
+[paths]
+athena_source = "/home/user0001/apps/athena-main"
+build_dir = "build/athena-harris-sheet"
+athenak_source = "unused"
+athenak_build_dir = "build/unused"
+output_root = "outputs/hs_sim"
+
+[execution]
+solver = "athena++"
+backend = "linux"
+dependency_prefix = "/home/user0001/.conda/envs/athena-build"
+threads = 1
+mpi_ranks = 16
+mpi_compiler = "mpicxx"
+mpi_launcher = "mpirun"
+julia_command = "julia"
+python_command = "python3"
+
+[build]
+eos = "isothermal"
+openmp = false
+mpi = true
+single_precision = false
+
+[athenak]
+revision = "5f1993109bcb2e5d588ba41b4efc897408e9959a"
+device = "cpu"
+kokkos_arch = ""
+integrator = "rk2"
+reconstruction = "plm"
+
+[simulation]
+run_name = "harris_sheet_athenapp_n256"
+resolution = 256
+meshblock = 32
+box_length = 1.0
+tlim = 0.5
+cfl = 0.30
+integrator = "vl2"
+reconstruction_order = 2
+rho0 = 1.0
+sound_speed = 1.0
+pressure0 = 1.0
+
+[harris_sheet]
+b0 = 1.0
+guide_b3 = 0.1
+sheet_width = 0.05
+noise_amplitude = 0.001
+
+[output]
+history_interval = 0.02
+snapshot_interval = 0.10
+restart_interval = 1.0
+slice_axis = "x3"
+slice_index = -1
+quiver_stride = 8
+snapshot_policy = "peak_current"

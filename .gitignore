@@ -4,6 +4,8 @@ configs/*.toml
 !configs/athenak-gpu-smoke.toml
 !configs/athenak-gpu-ma08-tiny.toml
 !configs/athenak-gpu-ma08.toml
+!configs/harris-sheet-athenapp.toml
+!configs/harris-sheet-athenak-gpu.toml
 
 # Disposable Athena++ build and simulation products.
 build/

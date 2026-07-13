@@ -44,18 +44,15 @@ def example_config(solver: str = "athena++"):
         "simulation": {
             "run_name": "case", "resolution": 16, "meshblock": 8,
             "box_length": 1.0, "tlim": 0.1, "cfl": 0.3, "rho0": 1.0,
-            "sound_speed": 0.75, "guide_field": [1.0, 0.25, -0.5],
+            "sound_speed": 0.75,
         },
-        "selection": {"metric": "ms", "target": 1.0},
-        "forcing": {
-            "mode": 2, "energy_injection_rate": 1.0, "nlow": 1, "nhigh": 4,
-            "spectrum_exponent": 2.0, "correlation_time": 0.1,
-            "drive_interval": 0.02, "solenoidal_fraction": 1.0,
-            "random_seed": 12345,
+        "harris_sheet": {
+            "b0": 1.0, "guide_b3": 0.1, "sheet_width": 0.05,
+            "noise_amplitude": 0.001,
         },
         "output": {
             "history_interval": 0.05, "snapshot_interval": 0.1,
-            "restart_interval": 1.0,
+            "restart_interval": 1.0, "snapshot_policy": "final",
         },
         "athenak": {
             "revision": pipeline.ATHENAK_REVISION, "device": "cpu", "kokkos_arch": "",
@@ -113,7 +110,8 @@ class SolverDispatchTests(unittest.TestCase):
         self.assertEqual(pipeline.effective_run_name(cfg), "case")
         text = pipeline.render_athinput(cfg)
         self.assertIn("problem_id = case", text)
-        self.assertIn("nlow = 1", text)
+        self.assertIn("b0 = 1", text)
+        self.assertIn("sheet_width = 0.05", text)
 
     def test_athenak_input_and_stable_name(self):
         cfg = example_config("athenak")
@@ -123,16 +121,20 @@ class SolverDispatchTests(unittest.TestCase):
         self.assertIn("eos = isothermal", text)
         self.assertIn("integrator = rk2", text)
         self.assertIn("reconstruct = plm", text)
-        self.assertIn("nlow = 2", text)
-        self.assertIn("nhigh = 3", text)
-        self.assertNotIn("random_seed", text)
-        self.assertNotIn("drive_interval", text)
+        self.assertIn("b0 = 1", text)
+        self.assertNotIn("turb_driving", text)
 
-    def test_athenak_rejects_mixed_forcing(self):
+    def test_athenak_particle_input(self):
         cfg = example_config("athenak")
-        cfg["forcing"]["solenoidal_fraction"] = 0.5
-        with self.assertRaisesRegex(ValueError, "only solenoidal"):
-            pipeline.validate_simulation_config(cfg)
+        cfg["athenak"].update(device="cuda", kokkos_arch="AMPERE80")
+        cfg["particles"] = {
+            "enabled": True, "nparticles": 16, "injection_radius": 0.01,
+            "velocity_scale": 0.0, "track_interval": 0.02,
+        }
+        text = pipeline.render_athinput(cfg)
+        self.assertIn("<particles>", text)
+        self.assertIn("file_type = trk", text)
+        self.assertIn("nparticles = 16", text)
 
     def test_cuda_cmake_command(self):
         cfg = example_config("athenak")

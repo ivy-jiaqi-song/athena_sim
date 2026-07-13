@@ -281,6 +281,7 @@ def prepare_athenak_build_tree(cfg: dict[str, Any], clean: bool) -> tuple[Path, 
         )
         nvcc_wrapper = source_copy / "kokkos" / "bin" / "nvcc_wrapper"
         if nvcc_wrapper.exists():
+            nvcc_wrapper.write_bytes(nvcc_wrapper.read_bytes().replace(b"\r\n", b"\n"))
             nvcc_wrapper.chmod(nvcc_wrapper.stat().st_mode | 0o755)
     target_pgen = source_copy / "src" / "pgen" / "mhd_turbulence.cpp"
     shutil.copy2(ATHENAK_PGEN_SOURCE, target_pgen)

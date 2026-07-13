@@ -8,9 +8,14 @@
 [paths]
 athena_source = "/home/user0001/apps/athena-main"
 build_dir = "build/athena"
+# External recursive AthenaK checkout pinned to [athenak].revision. The pipeline
+# copies it before installing the custom problem generator; this checkout is not modified.
+athenak_source = "/home/user0001/apps/athenak"
+athenak_build_dir = "build/athenak"
 output_root = "outputs"
 
 [execution]
+solver = "athena++"
 backend = "linux"
 dependency_prefix = "/home/user0001/.conda/envs/athena-build"
 threads = 1
@@ -25,6 +30,18 @@ eos = "isothermal"
 openmp = false
 mpi = true
 single_precision = false
+
+[athenak]
+revision = "5f1993109bcb2e5d588ba41b4efc897408e9959a"
+device = "cpu"
+# Required for device="cuda" (examples: AMPERE80, ADA89, HOPPER90). This is
+# machine-local and must match the installed NVIDIA GPU and Kokkos support.
+kokkos_arch = ""
+integrator = "rk2"
+reconstruction = "plm"
+# AthenaK includes shell endpoints, so 2..3 maps the Athena++ 1 < |k| < 4 intent.
+nlow = 2
+nhigh = 3
 
 [simulation]
 run_name = "mhd_256_ms_gt1"

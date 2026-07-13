@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, run, and analyze the local Athena++ MHD turbulence case."""
+"""Build, run, convert, and analyze Athena++/AthenaK MHD turbulence cases."""
 
 from __future__ import annotations
 
@@ -20,7 +20,10 @@ from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PGEN_SOURCE = ROOT / "solver" / "mhd_turbulence.cpp"
+ATHENAPP_PGEN_SOURCE = ROOT / "solver" / "mhd_turbulence.cpp"
+ATHENAK_PGEN_SOURCE = ROOT / "solver" / "athenak_mhd_turbulence.cpp"
+ATHENAK_REVISION = "5f1993109bcb2e5d588ba41b4efc897408e9959a"
+SOLVERS = ("athena++", "athenak")
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -31,6 +34,21 @@ def load_config(path: str | Path) -> dict[str, Any]:
     for section in ("paths", "execution", "build", "simulation", "forcing", "output", "selection"):
         if section not in cfg:
             raise ValueError(f"Missing [{section}] in {config_path}")
+    cfg["execution"].setdefault("solver", "athena++")
+    return cfg
+
+
+def solver_name(cfg: dict[str, Any]) -> str:
+    solver = str(cfg["execution"].get("solver", "athena++")).lower()
+    if solver not in SOLVERS:
+        raise ValueError(f"execution.solver must be one of {SOLVERS}, got {solver!r}")
+    return solver
+
+
+def set_solver(cfg: dict[str, Any], override: str | None) -> dict[str, Any]:
+    if override is not None:
+        cfg["execution"]["solver"] = override
+    solver_name(cfg)
     return cfg
 
 
@@ -121,7 +139,7 @@ def run_backend(
             output.close()
 
 
-def prepare_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
+def prepare_athenapp_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
     source = project_path(cfg["paths"]["athena_source"])
     build_dir = project_path(cfg["paths"]["build_dir"])
     if not (source / "configure.py").is_file():
@@ -136,7 +154,7 @@ def prepare_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
             ignore=shutil.ignore_patterns(".git", ".github", "doc", "tst", "vis", "__pycache__"),
         )
     target_pgen = build_dir / "src" / "pgen" / "mhd_turbulence.cpp"
-    shutil.copy2(PGEN_SOURCE, target_pgen)
+    shutil.copy2(ATHENAPP_PGEN_SOURCE, target_pgen)
     # Athena++ v24.0-145 detects GCC's __FLT16_MAX__ but then aliases the
     # ARM-only __fp16 spelling. On x86 GCC the supported spelling is _Float16.
     # Apply this narrowly to the disposable build copy, never to athena/.
@@ -159,8 +177,8 @@ def prepare_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
     return build_dir
 
 
-def build(cfg: dict[str, Any], clean: bool = False) -> Path:
-    build_dir = prepare_build_tree(cfg, clean)
+def build_athenapp(cfg: dict[str, Any], clean: bool = False) -> Path:
+    build_dir = prepare_athenapp_build_tree(cfg, clean)
     build_cfg = cfg["build"]
     execution = cfg["execution"]
     prefix = execution.get("dependency_prefix", "")
@@ -196,7 +214,128 @@ def build(cfg: dict[str, Any], clean: bool = False) -> Path:
     return binary
 
 
+def athenak_tree_paths(cfg: dict[str, Any]) -> tuple[Path, Path, Path]:
+    root = project_path(cfg["paths"]["athenak_build_dir"])
+    return root, root / "source", root / "build"
+
+
+def _git_revision(source: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"AthenaK source is not a Git checkout: {source}") from exc
+    return result.stdout.strip()
+
+
+def _validate_recursive_checkout(source: Path) -> None:
+    for arguments in (("diff", "--quiet"), ("diff", "--cached", "--quiet")):
+        result = subprocess.run(["git", "-C", str(source), *arguments], check=False)
+        if result.returncode != 0:
+            raise ValueError(f"AthenaK source has tracked local changes: {source}")
+    try:
+        gitlink = subprocess.run(
+            ["git", "-C", str(source), "ls-tree", "HEAD", "kokkos"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()[2]
+    except (subprocess.CalledProcessError, IndexError) as exc:
+        raise ValueError("AthenaK checkout does not contain the pinned Kokkos submodule") from exc
+    actual = _git_revision(source / "kokkos")
+    if actual != gitlink:
+        raise ValueError(f"AthenaK Kokkos submodule is at {actual}; expected {gitlink}")
+
+
+def prepare_athenak_build_tree(cfg: dict[str, Any], clean: bool) -> tuple[Path, Path]:
+    external_source = project_path(cfg["paths"]["athenak_source"])
+    expected_revision = str(cfg["athenak"].get("revision", ATHENAK_REVISION))
+    if not (external_source / "CMakeLists.txt").is_file():
+        raise FileNotFoundError(f"AthenaK source not found at {external_source}")
+    actual_revision = _git_revision(external_source)
+    if actual_revision != expected_revision:
+        raise ValueError(
+            f"AthenaK source revision is {actual_revision}; expected {expected_revision}"
+        )
+    if not (external_source / "kokkos" / "CMakeLists.txt").is_file():
+        raise FileNotFoundError("AthenaK Kokkos submodule is missing; update submodules recursively")
+    _validate_recursive_checkout(external_source)
+
+    root, source_copy, cmake_build = athenak_tree_paths(cfg)
+    if clean and root.exists():
+        shutil.rmtree(root)
+    if not source_copy.exists():
+        root.mkdir(parents=True, exist_ok=True)
+        print(f"[pipeline] copying pinned AthenaK source to {source_copy}")
+        shutil.copytree(
+            external_source,
+            source_copy,
+            ignore=shutil.ignore_patterns(".git", ".github", "build", "__pycache__"),
+        )
+    target_pgen = source_copy / "src" / "pgen" / "mhd_turbulence.cpp"
+    shutil.copy2(ATHENAK_PGEN_SOURCE, target_pgen)
+    cmake_build.mkdir(parents=True, exist_ok=True)
+    return source_copy, cmake_build
+
+
+def athenak_cmake_command(cfg: dict[str, Any], source: Path, cmake_build: Path) -> list[str]:
+    execution = cfg["execution"]
+    build_cfg = cfg["build"]
+    athenak_cfg = cfg["athenak"]
+    device = str(athenak_cfg.get("device", "cpu")).lower()
+    command = [
+        "cmake",
+        "-S", backend_path(source, cfg),
+        "-B", backend_path(cmake_build, cfg),
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DPROBLEM=mhd_turbulence",
+        f"-DAthena_SINGLE_PRECISION={'ON' if build_cfg.get('single_precision', False) else 'OFF'}",
+        f"-DAthena_ENABLE_MPI={'ON' if build_cfg.get('mpi', False) else 'OFF'}",
+        f"-DAthena_ENABLE_OPENMP={'ON' if build_cfg.get('openmp', False) else 'OFF'}",
+    ]
+    if build_cfg.get("mpi", False):
+        command.append(f"-DMPI_CXX_COMPILER={execution.get('mpi_compiler', 'mpicxx')}")
+    if device == "cpu":
+        command.append("-DKokkos_ARCH_NATIVE=ON")
+    else:
+        arch = str(athenak_cfg["kokkos_arch"])
+        wrapper = source / "kokkos" / "bin" / "nvcc_wrapper"
+        command.extend([
+            "-DKokkos_ENABLE_CUDA=ON",
+            f"-DKokkos_ARCH_{arch}=ON",
+            f"-DCMAKE_CXX_COMPILER={backend_path(wrapper, cfg)}",
+        ])
+    return command
+
+
+def build_athenak(cfg: dict[str, Any], clean: bool = False) -> Path:
+    validate_simulation_config(cfg)
+    source, cmake_build = prepare_athenak_build_tree(cfg, clean)
+    run_backend(athenak_cmake_command(cfg, source, cmake_build), ROOT, cfg)
+    jobs = max(1, int(cfg["execution"].get("threads", 1)))
+    run_backend(
+        ["cmake", "--build", backend_path(cmake_build, cfg), "--parallel", str(jobs)],
+        ROOT,
+        cfg,
+    )
+    candidates = (cmake_build / "src" / "athena", cmake_build / "athena")
+    binary = next((item for item in candidates if item.exists()), candidates[0])
+    if not binary.exists():
+        raise RuntimeError(f"AthenaK build completed without producing {binary}")
+    print(f"[pipeline] built {binary}")
+    return binary
+
+
+def build(cfg: dict[str, Any], clean: bool = False) -> Path:
+    return build_athenak(cfg, clean) if solver_name(cfg) == "athenak" else build_athenapp(cfg, clean)
+
+
 def validate_simulation_config(cfg: dict[str, Any]) -> None:
+    solver = solver_name(cfg)
     sim = cfg["simulation"]
     forcing = cfg["forcing"]
     selection = cfg["selection"]
@@ -215,10 +354,31 @@ def validate_simulation_config(cfg: dict[str, Any]) -> None:
     target = float(selection["target"])
     if not math.isfinite(target) or target <= 0.0:
         raise ValueError("selection.target must be a positive finite number")
+    if solver == "athenak":
+        if "athenak" not in cfg:
+            raise ValueError("Missing [athenak] for the AthenaK solver")
+        for key in ("athenak_source", "athenak_build_dir"):
+            if key not in cfg["paths"]:
+                raise ValueError(f"paths.{key} is required for the AthenaK solver")
+        ak = cfg["athenak"]
+        if str(ak.get("revision", "")) != ATHENAK_REVISION:
+            raise ValueError(f"athenak.revision must be pinned to {ATHENAK_REVISION}")
+        if str(ak.get("device", "cpu")).lower() not in ("cpu", "cuda"):
+            raise ValueError("athenak.device must be 'cpu' or 'cuda'")
+        if str(ak.get("device", "cpu")).lower() == "cuda" and not str(ak.get("kokkos_arch", "")).strip():
+            raise ValueError("athenak.kokkos_arch is required for CUDA builds")
+        if str(ak.get("integrator", "rk2")) != "rk2":
+            raise ValueError("This workflow requires athenak.integrator = 'rk2'")
+        if str(ak.get("reconstruction", "plm")) != "plm":
+            raise ValueError("This workflow requires athenak.reconstruction = 'plm'")
+        if (int(ak.get("nlow", 2)), int(ak.get("nhigh", 3))) != (2, 3):
+            raise ValueError("AthenaK shell mapping must use athenak.nlow=2 and athenak.nhigh=3")
+        if not math.isclose(float(forcing["solenoidal_fraction"]), 1.0, abs_tol=1.0e-12):
+            raise ValueError("AthenaK supports only solenoidal_fraction = 1.0")
 
 
-def render_athinput(cfg: dict[str, Any], run_name: str | None = None,
-                    guide_field: Iterable[float] | None = None) -> str:
+def render_athenapp_input(cfg: dict[str, Any], run_name: str | None = None,
+                          guide_field: Iterable[float] | None = None) -> str:
     validate_simulation_config(cfg)
     sim = cfg["simulation"]
     forcing = cfg["forcing"]
@@ -309,18 +469,114 @@ rseed = {int(forcing['random_seed'])}
 """
 
 
+def effective_run_name(cfg: dict[str, Any], run_name: str | None = None) -> str:
+    if run_name:
+        return run_name
+    base = str(cfg["simulation"]["run_name"])
+    return f"{base}_athenak" if solver_name(cfg) == "athenak" else base
+
+
+def render_athenak_input(cfg: dict[str, Any], run_name: str | None = None,
+                         guide_field: Iterable[float] | None = None) -> str:
+    validate_simulation_config(cfg)
+    sim = cfg["simulation"]
+    forcing = cfg["forcing"]
+    output = cfg["output"]
+    ak = cfg["athenak"]
+    name = effective_run_name(cfg, run_name)
+    n = int(sim["resolution"])
+    mb = int(sim["meshblock"])
+    half = 0.5 * float(sim["box_length"])
+    b1, b2, b3 = tuple(guide_field or sim["guide_field"])
+    return f"""<comment>
+problem = Homogeneous, driven, compressible isothermal MHD turbulence
+
+<job>
+basename = {name}
+
+<mesh>
+nghost = 2
+nx1 = {n}
+x1min = {-half:.16g}
+x1max = {half:.16g}
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = {n}
+x2min = {-half:.16g}
+x2max = {half:.16g}
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = {n}
+x3min = {-half:.16g}
+x3max = {half:.16g}
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = {mb}
+nx2 = {mb}
+nx3 = {mb}
+
+<time>
+evolution = dynamic
+integrator = {ak.get('integrator', 'rk2')}
+cfl_number = {float(sim['cfl']):.16g}
+nlim = -1
+tlim = {float(sim['tlim']):.16g}
+ndiag = 10
+
+<mhd>
+eos = isothermal
+reconstruct = {ak.get('reconstruction', 'plm')}
+rsolver = hlld
+iso_sound_speed = {float(sim['sound_speed']):.16g}
+
+<problem>
+rho0 = {float(sim['rho0']):.16g}
+b1 = {float(b1):.16g}
+b2 = {float(b2):.16g}
+b3 = {float(b3):.16g}
+
+<turb_driving>
+type = mhd
+driving_type = 0
+dedt = {float(forcing['energy_injection_rate']):.16g}
+tcorr = {float(forcing['correlation_time']):.16g}
+expo = {float(forcing['spectrum_exponent']):.16g}
+nlow = {int(ak.get('nlow', 2))}
+nhigh = {int(ak.get('nhigh', 3))}
+
+<output1>
+file_type = hst
+dt = {float(output['history_interval']):.16g}
+
+<output2>
+file_type = bin
+variable = mhd_w_bcc
+id = out2
+single_file_per_rank = false
+dt = {float(output['snapshot_interval']):.16g}
+
+<output3>
+file_type = rst
+dt = {float(output['restart_interval']):.16g}
+"""
+
+
+def render_athinput(cfg: dict[str, Any], run_name: str | None = None,
+                    guide_field: Iterable[float] | None = None) -> str:
+    if solver_name(cfg) == "athenak":
+        return render_athenak_input(cfg, run_name, guide_field)
+    return render_athenapp_input(cfg, run_name, guide_field)
+
+
 def run_directory(cfg: dict[str, Any], run_name: str | None = None) -> Path:
-    name = run_name or str(cfg["simulation"]["run_name"])
+    name = effective_run_name(cfg, run_name)
     return project_path(cfg["paths"]["output_root"]) / name
 
 
-def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
-                   run_name: str | None = None,
-                   guide_field: Iterable[float] | None = None) -> Path:
-    build_dir = project_path(cfg["paths"]["build_dir"])
-    binary = build_dir / "bin" / "athena"
-    if not binary.exists():
-        raise FileNotFoundError("Athena++ binary is missing; run the build command first")
+def _prepare_run_directory(cfg: dict[str, Any], overwrite: bool,
+                           run_name: str | None) -> Path:
     run_dir = run_directory(cfg, run_name)
     if run_dir.exists() and overwrite:
         if run_dir == run_dir.parent or run_dir.name in ("", ".", ".."):
@@ -329,6 +585,17 @@ def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
     if run_dir.exists() and any(run_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {run_dir}; pass --overwrite")
     run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def run_athenapp(cfg: dict[str, Any], overwrite: bool = False,
+                 run_name: str | None = None,
+                 guide_field: Iterable[float] | None = None) -> Path:
+    build_dir = project_path(cfg["paths"]["build_dir"])
+    binary = build_dir / "bin" / "athena"
+    if not binary.exists():
+        raise FileNotFoundError("Athena++ binary is missing; run the build command first")
+    run_dir = _prepare_run_directory(cfg, overwrite, run_name)
     input_path = run_dir / "athinput.generated"
     # Athena++'s parameter parser does not strip a Windows carriage return
     # from string values (for example, it reads "periodic\r"). Force LF.
@@ -348,6 +615,99 @@ def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
         raise RuntimeError(f"Athena++ reported a fatal error; inspect {log_path}")
     print(f"[pipeline] simulation log: {log_path}")
     return run_dir
+
+
+def athenak_binary(cfg: dict[str, Any]) -> Path:
+    _, _, cmake_build = athenak_tree_paths(cfg)
+    candidates = (cmake_build / "src" / "athena", cmake_build / "athena")
+    return next((item for item in candidates if item.exists()), candidates[0])
+
+
+def run_athenak(cfg: dict[str, Any], overwrite: bool = False,
+                run_name: str | None = None,
+                guide_field: Iterable[float] | None = None) -> Path:
+    validate_simulation_config(cfg)
+    binary = athenak_binary(cfg)
+    if not binary.exists():
+        raise FileNotFoundError("AthenaK binary is missing; run the build command first")
+    run_dir = _prepare_run_directory(cfg, overwrite, run_name)
+    input_path = run_dir / "athinput.generated"
+    input_path.write_text(
+        render_athenak_input(cfg, run_name, guide_field), encoding="utf-8", newline="\n"
+    )
+    command = [backend_path(binary, cfg), "-i", "athinput.generated"]
+    mpi_ranks = int(cfg["execution"].get("mpi_ranks", 1))
+    if cfg["build"].get("mpi", False) and mpi_ranks > 1:
+        command = [cfg["execution"].get("mpi_launcher", "mpirun"), "-np", str(mpi_ranks)] + command
+    log_path = run_dir / "run.log"
+    run_backend(command, run_dir, cfg, log_path=log_path)
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if "FATAL ERROR" in log_text:
+        raise RuntimeError(f"AthenaK reported a fatal error; inspect {log_path}")
+    metadata = {
+        "solver": "athenak",
+        "revision": str(cfg["athenak"]["revision"]),
+        "device": str(cfg["athenak"].get("device", "cpu")),
+        "kokkos_arch": str(cfg["athenak"].get("kokkos_arch", "")),
+        "backend_controls": {
+            "forcing.drive_interval": "not applicable; AthenaK advances OU forcing each timestep",
+            "forcing.random_seed": "not applicable; pinned AthenaK uses its native internal RNG initialization",
+        },
+    }
+    (run_dir / "solver_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"[pipeline] simulation log: {log_path}")
+    convert_athenak_outputs(cfg, run_name)
+    return run_dir
+
+
+def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
+                   run_name: str | None = None,
+                   guide_field: Iterable[float] | None = None) -> Path:
+    if solver_name(cfg) == "athenak":
+        return run_athenak(cfg, overwrite, run_name, guide_field)
+    return run_athenapp(cfg, overwrite, run_name, guide_field)
+
+
+def _load_athenak_converter() -> Any:
+    import importlib.util
+
+    path = ROOT / "scripts" / "athenak_to_athdf.py"
+    spec = importlib.util.spec_from_file_location("athenak_to_athdf", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load AthenaK converter at {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def convert_athenak_outputs(cfg: dict[str, Any], run_name: str | None = None) -> list[Path]:
+    if solver_name(cfg) != "athenak":
+        print("[pipeline] Athena++ writes ATHDF directly; no conversion is required")
+        return []
+    run_dir = run_directory(cfg, run_name)
+    binary_dir = run_dir / "bin"
+    if not binary_dir.is_dir():
+        raise FileNotFoundError(f"No AthenaK binary output directory found at {binary_dir}")
+    name = effective_run_name(cfg, run_name)
+    converter = _load_athenak_converter()
+    sources = sorted(binary_dir.glob(f"{name}.out2.*.bin"))
+    if not sources:
+        raise FileNotFoundError(f"No shared AthenaK mhd_w_bcc binary snapshots found in {binary_dir}")
+    results: list[Path] = []
+    for source in sources:
+        destination = run_dir / converter.output_name(name, source)
+        if destination.exists() and destination.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+            print(f"[pipeline] already converted {source.name}")
+        else:
+            print(f"[pipeline] converting {source.name} -> {destination.name}")
+            converter.convert_file(source, destination)
+        results.append(destination)
+    return results
+
+
+def convert(cfg: dict[str, Any], run_name: str | None = None) -> list[Path]:
+    return convert_athenak_outputs(cfg, run_name)
 
 
 def _variable_map(handle: Any) -> dict[str, tuple[str, int]]:
@@ -721,7 +1081,7 @@ def plot_energy_history(history_path: Path, output_path: Path,
         ax.plot(time, history["tot-E"], label="total", linewidth=1.2, linestyle="--")
     ax.set_xlabel("time")
     ax.set_ylabel("volume-averaged energy density")
-    ax.set_title("Athena++ energy history")
+    ax.set_title("Athena energy history")
     ax.grid(alpha=0.25)
     ax.legend()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -730,10 +1090,14 @@ def plot_energy_history(history_path: Path, output_path: Path,
     return saturation_diagnostic(history, minimum_saturation_time)
 
 
-def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+def analyze_common(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     run_dir = run_directory(cfg, run_name)
     snapshots = sorted(run_dir.glob("*.athdf"))
-    history_files = sorted(run_dir.glob("*.hst"))
+    if solver_name(cfg) == "athenak":
+        history_files = [run_dir / f"{effective_run_name(cfg, run_name)}.mhd.hst"]
+        history_files = [path for path in history_files if path.is_file()]
+    else:
+        history_files = sorted(run_dir.glob("*.hst"))
     if not snapshots:
         raise FileNotFoundError(f"No .athdf snapshots found in {run_dir}")
     if not history_files:
@@ -778,6 +1142,7 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     summary = {
         "run_directory": str(run_dir),
         "configuration": str(cfg["_config_path"]),
+        "solver": solver_metadata(cfg, run_dir),
         "definitions": {
             "sonic_mach": "density-weighted turbulent v_rms / isothermal sound speed",
             "alfvenic_mach_velocity": "density-weighted turbulent v_rms / (|<B>|/sqrt(<rho>))",
@@ -808,28 +1173,61 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     return analysis_dir
 
 
+def analyze_athenapp(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+    return analyze_common(cfg, run_name)
+
+
+def analyze_athenak(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+    return analyze_common(cfg, run_name)
+
+
+def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+    if solver_name(cfg) == "athenak":
+        return analyze_athenak(cfg, run_name)
+    return analyze_athenapp(cfg, run_name)
+
+
+def solver_metadata(cfg: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    solver = solver_name(cfg)
+    if solver == "athenak":
+        path = run_dir / "solver_metadata.json"
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "solver": solver,
+            "revision": str(cfg["athenak"]["revision"]),
+            "device": str(cfg["athenak"].get("device", "cpu")),
+            "kokkos_arch": str(cfg["athenak"].get("kokkos_arch", "")),
+        }
+    return {"solver": solver, "revision": "not recorded", "device": "cpu"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("build", "run", "analyze", "all", "input"))
+    parser.add_argument("command", choices=("build", "run", "convert", "analyze", "all", "input"))
     parser.add_argument("--config", default=str(ROOT / "configs" / "local.toml"))
+    parser.add_argument("--solver", choices=SOLVERS, help="override execution.solver")
     parser.add_argument("--clean", action="store_true", help="recreate the disposable Athena build tree")
     parser.add_argument("--overwrite", action="store_true", help="replace the selected run directory")
     parser.add_argument("--run-name", help="override simulation.run_name")
     args = parser.parse_args()
 
     try:
-        cfg = load_config(args.config)
+        cfg = set_solver(load_config(args.config), args.solver)
         if args.command == "input":
             sys.stdout.write(render_athinput(cfg, args.run_name))
         elif args.command == "build":
             build(cfg, clean=args.clean)
         elif args.command == "run":
             run_simulation(cfg, overwrite=args.overwrite, run_name=args.run_name)
+        elif args.command == "convert":
+            convert(cfg, run_name=args.run_name)
         elif args.command == "analyze":
             analyze(cfg, run_name=args.run_name)
         elif args.command == "all":
             build(cfg, clean=args.clean)
             run_simulation(cfg, overwrite=args.overwrite, run_name=args.run_name)
+            convert(cfg, run_name=args.run_name)
             analyze(cfg, run_name=args.run_name)
     except (FileNotFoundError, FileExistsError, KeyError, RuntimeError, ValueError,
             subprocess.CalledProcessError) as exc:

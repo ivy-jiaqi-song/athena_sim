@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import struct
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import h5py
@@ -16,12 +19,170 @@ def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
 pipeline = load_module("pipeline", ROOT / "scripts" / "pipeline.py")
 bfield = load_module("make_bfield_slices", ROOT / "scripts" / "make_bfield_slices.py")
+converter = load_module("athenak_to_athdf", ROOT / "scripts" / "athenak_to_athdf.py")
+
+
+def example_config(solver: str = "athena++"):
+    return {
+        "_config_path": str(ROOT / "configs" / "example.toml"),
+        "paths": {
+            "athena_source": "athena",
+            "build_dir": "build/athena",
+            "athenak_source": "athenak",
+            "athenak_build_dir": "build/athenak",
+            "output_root": "outputs",
+        },
+        "execution": {"solver": solver, "backend": "linux", "threads": 2},
+        "build": {"eos": "isothermal", "mpi": False, "openmp": False},
+        "simulation": {
+            "run_name": "case", "resolution": 16, "meshblock": 8,
+            "box_length": 1.0, "tlim": 0.1, "cfl": 0.3, "rho0": 1.0,
+            "sound_speed": 0.75, "guide_field": [1.0, 0.25, -0.5],
+        },
+        "selection": {"metric": "ms", "target": 1.0},
+        "forcing": {
+            "mode": 2, "energy_injection_rate": 1.0, "nlow": 1, "nhigh": 4,
+            "spectrum_exponent": 2.0, "correlation_time": 0.1,
+            "drive_interval": 0.02, "solenoidal_fraction": 1.0,
+            "random_seed": 12345,
+        },
+        "output": {
+            "history_interval": 0.05, "snapshot_interval": 0.1,
+            "restart_interval": 1.0,
+        },
+        "athenak": {
+            "revision": pipeline.ATHENAK_REVISION, "device": "cpu", "kokkos_arch": "",
+            "integrator": "rk2", "reconstruction": "plm", "nlow": 2, "nhigh": 3,
+        },
+    }
+
+
+def write_athenak_fixture(path: Path) -> list[np.ndarray]:
+    parameters = """<job>\nbasename = fixture\n<mesh>\nnghost = 2\nnx1 = 4\nnx2 = 2\nnx3 = 2\nx1min = -0.5\nx1max = 0.5\nx2min = -0.5\nx2max = 0.5\nx3min = -0.5\nx3max = 0.5\n<meshblock>\nnx1 = 2\nnx2 = 2\nnx3 = 2\n""".encode()
+    prefix = (
+        b"Athena binary output version=1.1\n"
+        b"  size of preheader=5\n"
+        b"  time=2.5000000000000000e-01\n"
+        b"  cycle=7\n"
+        b"  size of location=8\n"
+        b"  size of variable=4\n"
+        b"  number of variables=7\n"
+        b"  variables:  dens  velx  vely  velz  bcc1  bcc2  bcc3  \n"
+        + f"  header offset={len(parameters)}\n".encode()
+        + parameters
+    )
+    blocks = []
+    with path.open("wb") as stream:
+        stream.write(prefix)
+        for block_index, (logical_x, xmin, xmax) in enumerate(((0, -0.5, 0.0), (1, 0.0, 0.5))):
+            stream.write(struct.pack("<10i", 2, 3, 2, 3, 2, 3, logical_x, 0, 0, 0))
+            stream.write(struct.pack("<6d", xmin, xmax, -0.5, 0.5, -0.5, 0.5))
+            values = np.empty((7, 2, 2, 2), dtype="<f4")
+            values[0] = 1.0 + block_index
+            values[1] = 0.1 + block_index
+            values[2] = 0.2
+            values[3] = 0.3
+            values[4] = 1.0
+            values[5] = 0.25
+            values[6] = -0.5
+            stream.write(values.tobytes(order="C"))
+            blocks.append(values)
+    return blocks
+
+
+class SolverDispatchTests(unittest.TestCase):
+    def test_build_and_analyze_dispatch(self):
+        cfg = example_config("athenak")
+        with mock.patch.object(pipeline, "build_athenak", return_value=Path("athena")) as build:
+            self.assertEqual(pipeline.build(cfg), Path("athena"))
+            build.assert_called_once_with(cfg, False)
+        with mock.patch.object(pipeline, "analyze_athenak", return_value=Path("analysis")) as analyze:
+            self.assertEqual(pipeline.analyze(cfg), Path("analysis"))
+            analyze.assert_called_once_with(cfg, None)
+
+    def test_default_solver_preserves_athenapp_name_and_input(self):
+        cfg = example_config()
+        self.assertEqual(pipeline.solver_name(cfg), "athena++")
+        self.assertEqual(pipeline.effective_run_name(cfg), "case")
+        text = pipeline.render_athinput(cfg)
+        self.assertIn("problem_id = case", text)
+        self.assertIn("nlow = 1", text)
+
+    def test_athenak_input_and_stable_name(self):
+        cfg = example_config("athenak")
+        self.assertEqual(pipeline.effective_run_name(cfg), "case_athenak")
+        text = pipeline.render_athinput(cfg)
+        self.assertIn("basename = case_athenak", text)
+        self.assertIn("eos = isothermal", text)
+        self.assertIn("integrator = rk2", text)
+        self.assertIn("reconstruct = plm", text)
+        self.assertIn("nlow = 2", text)
+        self.assertIn("nhigh = 3", text)
+        self.assertNotIn("random_seed", text)
+        self.assertNotIn("drive_interval", text)
+
+    def test_athenak_rejects_mixed_forcing(self):
+        cfg = example_config("athenak")
+        cfg["forcing"]["solenoidal_fraction"] = 0.5
+        with self.assertRaisesRegex(ValueError, "only solenoidal"):
+            pipeline.validate_simulation_config(cfg)
+
+    def test_cuda_cmake_command(self):
+        cfg = example_config("athenak")
+        cfg["athenak"].update(device="cuda", kokkos_arch="AMPERE80")
+        cfg["build"]["mpi"] = True
+        command = pipeline.athenak_cmake_command(cfg, Path("/src"), Path("/build"))
+        self.assertIn("-DKokkos_ENABLE_CUDA=ON", command)
+        self.assertIn("-DKokkos_ARCH_AMPERE80=ON", command)
+        self.assertIn("-DAthena_ENABLE_MPI=ON", command)
+        self.assertTrue(any("nvcc_wrapper" in item for item in command))
+
+    def test_cpu_cmake_command_uses_native_arch(self):
+        cfg = example_config("athenak")
+        command = pipeline.athenak_cmake_command(cfg, Path("source"), Path("build"))
+        self.assertIn("-DKokkos_ARCH_NATIVE=ON", command)
+        self.assertNotIn("-DKokkos_ENABLE_CUDA=ON", command)
+
+
+class AthenaKConverterTests(unittest.TestCase):
+    def test_streaming_multiblock_conversion(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            root = Path(temporary)
+            source = root / "fixture.out2.00003.bin"
+            expected = write_athenak_fixture(source)
+            destination = root / converter.output_name("fixture_athenak", source)
+            converter.convert_file(source, destination)
+            self.assertEqual(destination.name, "fixture_athenak.out2.00003.athdf")
+            self.assertFalse(any(root.glob("*.tmp-*")))
+            with h5py.File(destination, "r") as handle:
+                self.assertEqual(tuple(x.decode() for x in handle.attrs["DatasetNames"]), ("prim", "B"))
+                self.assertEqual(tuple(handle.attrs["NumVariables"]), (4, 3))
+                self.assertEqual(
+                    tuple(x.decode() for x in handle.attrs["VariableNames"]),
+                    converter.TARGET_NAMES,
+                )
+                np.testing.assert_array_equal(handle.attrs["RootGridSize"], [4, 2, 2])
+                np.testing.assert_array_equal(handle.attrs["MeshBlockSize"], [2, 2, 2])
+                np.testing.assert_array_equal(handle["LogicalLocations"], [[0, 0, 0], [1, 0, 0]])
+                np.testing.assert_array_equal(handle["Levels"], [0, 0])
+                self.assertEqual(handle["prim"].dtype, np.dtype("<f4"))
+                self.assertEqual(handle["B"].dtype, np.dtype("<f4"))
+                np.testing.assert_array_equal(handle["prim"][:, 0], expected[0][:4])
+                np.testing.assert_array_equal(handle["B"][:, 1], expected[1][4:])
+                np.testing.assert_allclose(handle["x1f"][0], [-0.5, -0.25, 0.0])
+                np.testing.assert_allclose(handle["x1v"][1], [0.125, 0.375])
+            diagnostics = pipeline.snapshot_diagnostics(destination, 0.75)
+            self.assertAlmostEqual(diagnostics["mean_density"], 1.5)
+            np.testing.assert_allclose(diagnostics["mean_magnetic_field"], [1.0, 0.25, -0.5])
+            velocity_slice = pipeline.extract_velocity_slice(destination, "x3", 0)
+            self.assertEqual(velocity_slice["velocity"][0].shape, (2, 4))
 
 
 class SelectionTests(unittest.TestCase):
@@ -82,7 +243,7 @@ class SelectionTests(unittest.TestCase):
 
 class BFieldSliceTests(unittest.TestCase):
     def test_writes_three_slices(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             root = Path(temporary)
             input_path = root / "snapshot.h5"
             with h5py.File(input_path, "w") as handle:

@@ -279,6 +279,9 @@ def prepare_athenak_build_tree(cfg: dict[str, Any], clean: bool) -> tuple[Path, 
             source_copy,
             ignore=shutil.ignore_patterns(".git", ".github", "build", "__pycache__"),
         )
+        nvcc_wrapper = source_copy / "kokkos" / "bin" / "nvcc_wrapper"
+        if nvcc_wrapper.exists():
+            nvcc_wrapper.chmod(nvcc_wrapper.stat().st_mode | 0o755)
     target_pgen = source_copy / "src" / "pgen" / "mhd_turbulence.cpp"
     shutil.copy2(ATHENAK_PGEN_SOURCE, target_pgen)
     cmake_build.mkdir(parents=True, exist_ok=True)

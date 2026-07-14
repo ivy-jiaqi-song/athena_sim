@@ -12,7 +12,7 @@ import pipeline
 
 
 def advancing_timesteps(history: dict[str, list[float]]) -> list[float]:
-    """Return physical timesteps, excluding duplicate terminal history records."""
+    """Return CFL timesteps, excluding the final tlim-clipped history record."""
     times = [float(value) for value in history.get("time", [])]
     timesteps = [float(value) for value in history.get("dt", [])]
     if len(times) != len(timesteps):
@@ -21,7 +21,7 @@ def advancing_timesteps(history: dict[str, list[float]]) -> list[float]:
     tolerance = 1.0e-7 * scale
     return [
         timestep
-        for index, timestep in enumerate(timesteps)
+        for index, timestep in enumerate(timesteps[:-1])
         if timestep > 0.0
         and (index == 0 or times[index] > times[index - 1] + tolerance)
     ]

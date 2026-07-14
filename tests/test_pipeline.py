@@ -342,6 +342,10 @@ class WorkflowControlTests(unittest.TestCase):
         }
         self.assertEqual(preflight.advancing_timesteps(history), [0.002, 0.001])
 
+        # read_history keeps the later record when terminal times compare equal.
+        collapsed = {"time": [0.08, 0.10], "dt": [0.002, 1.0e-8]}
+        self.assertEqual(preflight.advancing_timesteps(collapsed), [0.002])
+
     def test_preflight_accepts_fp32_tlim_roundoff(self):
         common = {
             "finite": True, "minimum_density": 0.9, "mass_drift": 1.0e-7,

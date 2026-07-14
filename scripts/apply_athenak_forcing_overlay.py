@@ -119,7 +119,7 @@ def _patch_driver(text: str) -> str:
     text = text[:body] + (
         "  Mesh *pm = pmy_pack->pmesh;\n"
         "  const Real cadence_eps = 64.0*std::numeric_limits<Real>::epsilon() *\n"
-        "                           std::max(1.0, std::abs(pm->time));\n"
+        "                           std::max(static_cast<Real>(1.0), std::abs(pm->time));\n"
         "  if (pm->time + cadence_eps < next_turb_update) return TaskStatus::complete;"
     ) + text[body + len("  Mesh *pm = pmy_pack->pmesh;"):]
 
@@ -148,8 +148,8 @@ def _patch_driver(text: str) -> str:
         tail,
         "  return TaskStatus::complete;\n}\n\n",
         "  ++n_turb_updates;\n"
-        "  next_turb_update = (std::floor((pm->time + cadence_eps)/dt_turb_update) + 1.0) *\n"
-        "                     dt_turb_update;\n"
+        "  next_turb_update = static_cast<Real>(\n"
+        "      std::floor((pm->time + cadence_eps)/dt_turb_update) + 1.0) * dt_turb_update;\n"
         "  return TaskStatus::complete;\n}\n\n",
         "forcing update completion",
     )
@@ -210,8 +210,9 @@ def _patch_mesh(text: str) -> str:
         "  if (pmb_pack->pturb != nullptr) {\n"
         "    const Real cadence = pmb_pack->pturb->dt_turb_update;\n"
         "    const Real eps = 64.0*std::numeric_limits<Real>::epsilon() *\n"
-        "                     std::max(1.0, std::abs(time));\n"
-        "    const Real boundary = (std::floor((time + eps)/cadence) + 1.0)*cadence;\n"
+        "                     std::max(static_cast<Real>(1.0), std::abs(time));\n"
+        "    const Real boundary = static_cast<Real>(\n"
+        "        std::floor((time + eps)/cadence) + 1.0)*cadence;\n"
         "    if (boundary > time + eps) dt = std::min(dt, boundary - time);\n"
         "  }\n\n"
         "  // limit last time step to stop at tlim *exactly*\n"

@@ -25,7 +25,7 @@ ATHENAPP_PGEN_SOURCE = ROOT / "solver" / "mhd_turbulence.cpp"
 ATHENAK_PGEN_SOURCE = ROOT / "solver" / "athenak_mhd_turbulence.cpp"
 ATHENAK_REVISION = "5f1993109bcb2e5d588ba41b4efc897408e9959a"
 ATHENAK_FORCING_OVERLAY_SHA256 = (
-    "caeec1e1e66d416ef578bb62dce1497dd7f1d832f65f92ec0fa273fa4c04efda"
+    "4050169927d2b8e84fec290b08d720389693024d05dd042189af64d83f61ee89"
 )
 SOLVERS = ("athena++", "athenak")
 

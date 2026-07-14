@@ -335,6 +335,23 @@ class WorkflowControlTests(unittest.TestCase):
         fp64["kinetic_energy_density"] = 1.10
         self.assertFalse(preflight.validate(fp32, fp64)["passed"])
 
+    def test_preflight_ignores_duplicate_terminal_timestep(self):
+        history = {
+            "time": [0.08, 0.10, 0.10],
+            "dt": [0.002, 0.001, 1.0e-8],
+        }
+        self.assertEqual(preflight.advancing_timesteps(history), [0.002, 0.001])
+
+    def test_preflight_accepts_fp32_tlim_roundoff(self):
+        common = {
+            "finite": True, "minimum_density": 0.9, "mass_drift": 1.0e-7,
+            "timestep_collapse": 2.0, "final_time": 0.100000001,
+            "final_cycle": 20, "tlim": 0.1, "nlim": 5000,
+            "kinetic_energy_density": 1.0, "magnetic_energy_density": 2.0,
+            "alfvenic_mach_magnetic": 0.5,
+        }
+        self.assertTrue(preflight.validate(common, common)["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

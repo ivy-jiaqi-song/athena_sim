@@ -11,6 +11,22 @@ from pathlib import Path
 import pipeline
 
 
+def advancing_timesteps(history: dict[str, list[float]]) -> list[float]:
+    """Return physical timesteps, excluding duplicate terminal history records."""
+    times = [float(value) for value in history.get("time", [])]
+    timesteps = [float(value) for value in history.get("dt", [])]
+    if len(times) != len(timesteps):
+        return [value for value in timesteps if value > 0.0]
+    scale = max(1.0, *(abs(value) for value in times)) if times else 1.0
+    tolerance = 1.0e-7 * scale
+    return [
+        timestep
+        for index, timestep in enumerate(timesteps)
+        if timestep > 0.0
+        and (index == 0 or times[index] > times[index - 1] + tolerance)
+    ]
+
+
 def summarize(config_path: Path) -> dict[str, float | int | bool | str]:
     cfg = pipeline.load_config(config_path)
     run_dir = pipeline.run_directory(cfg)
@@ -24,7 +40,7 @@ def summarize(config_path: Path) -> dict[str, float | int | bool | str]:
     ]
     history_path = run_dir / f"{name}.mhd.hst"
     history = pipeline.read_history(history_path)
-    dt_values = [float(value) for value in history.get("dt", []) if float(value) > 0.0]
+    dt_values = advancing_timesteps(history)
     initial_mass = float(diagnostics[0]["mean_density"])
     final_mass = float(diagnostics[-1]["mean_density"])
     final = diagnostics[-1]
@@ -64,7 +80,11 @@ def validate(fp32: dict, fp64: dict) -> dict:
             errors.append(
                 f"{label}: timestep max/min {result['timestep_collapse']:.3g} > 10"
             )
-        tolerance = 64.0 * math.ulp(max(1.0, float(result["tlim"])))
+        # AthenaK writes FP32 snapshot times with small representation error.
+        tolerance = max(
+            64.0 * math.ulp(max(1.0, float(result["tlim"]))),
+            1.0e-6 * max(1.0, abs(float(result["tlim"]))),
+        )
         if abs(float(result["final_time"]) - float(result["tlim"])) > tolerance:
             errors.append(f"{label}: did not terminate on tlim")
         if int(result["nlim"]) > 0 and int(result["final_cycle"]) >= int(result["nlim"]):

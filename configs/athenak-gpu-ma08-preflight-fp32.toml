@@ -2,7 +2,7 @@
 athena_source = "unused"
 build_dir = "build/unused"
 athenak_source = "/home/user0001/apps/athenak-main"
-athenak_build_dir = "build/athenak-cuda-ma08-preflight-fp64"
+athenak_build_dir = "build/athenak-cuda-ma08-preflight-fp32"
 output_root = "/home/user0001/MHDFlows_replicate/outputs/athenak_cuda_tests"
 
 [execution]
@@ -21,10 +21,9 @@ simulation_timeout = 6600
 eos = "isothermal"
 openmp = false
 mpi = false
-single_precision = false
+single_precision = true
 
 [athenak]
-# The remote AthenaK source was provided as a zip archive, not a Git checkout.
 revision = ""
 device = "cuda"
 kokkos_arch = "BLACKWELL120"
@@ -32,7 +31,7 @@ integrator = "rk2"
 reconstruction = "plm"
 
 [simulation]
-run_name = "ma08_cs1_athenak_cuda_n64_preflight_fp64"
+run_name = "ma08_cs1_athenak_cuda_n64_preflight_fp32"
 resolution = 64
 meshblock = 32
 box_length = 1.0

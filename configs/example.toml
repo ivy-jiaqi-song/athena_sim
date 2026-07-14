@@ -39,9 +39,8 @@ device = "cpu"
 kokkos_arch = ""
 integrator = "rk2"
 reconstruction = "plm"
-# AthenaK includes shell endpoints, so 2..3 maps the Athena++ 1 < |k| < 4 intent.
-nlow = 2
-nhigh = 3
+# Athena++'s exclusive forcing bounds below are translated to AthenaK's
+# inclusive bounds (nlow+1, nhigh-1).
 
 [simulation]
 run_name = "mhd_256_ms_gt1"

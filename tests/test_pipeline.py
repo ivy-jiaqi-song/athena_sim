@@ -27,6 +27,7 @@ def load_module(name: str, path: Path):
 pipeline = load_module("pipeline", ROOT / "scripts" / "pipeline.py")
 bfield = load_module("make_bfield_slices", ROOT / "scripts" / "make_bfield_slices.py")
 converter = load_module("athenak_to_athdf", ROOT / "scripts" / "athenak_to_athdf.py")
+preflight = load_module("validate_ma08_preflight", ROOT / "scripts" / "validate_ma08_preflight.py")
 
 
 def example_config(solver: str = "athena++"):
@@ -59,7 +60,7 @@ def example_config(solver: str = "athena++"):
         },
         "athenak": {
             "revision": pipeline.ATHENAK_REVISION, "device": "cpu", "kokkos_arch": "",
-            "integrator": "rk2", "reconstruction": "plm", "nlow": 2, "nhigh": 3,
+            "integrator": "rk2", "reconstruction": "plm",
         },
     }
 
@@ -125,13 +126,16 @@ class SolverDispatchTests(unittest.TestCase):
         self.assertIn("reconstruct = plm", text)
         self.assertIn("nlow = 2", text)
         self.assertIn("nhigh = 3", text)
-        self.assertNotIn("random_seed", text)
-        self.assertNotIn("drive_interval", text)
+        self.assertIn("turb_flag = 2", text)
+        self.assertIn("dt_turb_update = 0.02", text)
+        self.assertIn("sol_fraction = 1", text)
+        self.assertIn("random_seed = 12345", text)
+        self.assertIn("spect_form = 2", text)
 
-    def test_athenak_rejects_mixed_forcing(self):
+    def test_athenak_rejects_duplicate_forcing_band(self):
         cfg = example_config("athenak")
-        cfg["forcing"]["solenoidal_fraction"] = 0.5
-        with self.assertRaisesRegex(ValueError, "only solenoidal"):
+        cfg["athenak"]["nlow"] = 2
+        with self.assertRaisesRegex(ValueError, "duplicate"):
             pipeline.validate_simulation_config(cfg)
 
     def test_cuda_cmake_command(self):
@@ -153,10 +157,16 @@ class SolverDispatchTests(unittest.TestCase):
 
 class AthenaKConverterTests(unittest.TestCase):
     def test_streaming_multiblock_conversion(self):
-        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "fixture.out2.00003.bin"
             expected = write_athenak_fixture(source)
+            raw_diagnostics = pipeline.athenak_snapshot_diagnostics(source, 0.75)
+            self.assertEqual(raw_diagnostics["cycle"], 7)
+            self.assertEqual(raw_diagnostics["time"], 0.25)
+            self.assertTrue(raw_diagnostics["finite_state"])
+            self.assertGreater(raw_diagnostics["minimum_density"], 0.0)
+            self.assertAlmostEqual(raw_diagnostics["mean_density"], 1.5)
             destination = root / converter.output_name("fixture_athenak", source)
             converter.convert_file(source, destination)
             self.assertEqual(destination.name, "fixture_athenak.out2.00003.athdf")
@@ -243,7 +253,7 @@ class SelectionTests(unittest.TestCase):
 
 class BFieldSliceTests(unittest.TestCase):
     def test_writes_three_slices(self):
-        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             input_path = root / "snapshot.h5"
             with h5py.File(input_path, "w") as handle:
@@ -259,6 +269,69 @@ class BFieldSliceTests(unittest.TestCase):
                 for name, config in bfield.SLICES.items()
             ]
             self.assertTrue(all(path.is_file() for path in outputs))
+
+
+class WorkflowControlTests(unittest.TestCase):
+    def test_convert_reuses_selected_metadata(self):
+        cfg = example_config("athenak")
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            analysis = run_dir / "analysis"
+            analysis.mkdir()
+            summary = {
+                "target_selection": {
+                    "snapshot": {"file": "bin/selected.bin", "time": 1.0}
+                }
+            }
+            (analysis / "diagnostics.json").write_text(
+                __import__("json").dumps(summary), encoding="utf-8"
+            )
+            products = {
+                "source_snapshot": str(run_dir / "bin" / "selected.bin"),
+                "selected_athdf": str(analysis / "selected_snapshot" / "selected.athdf"),
+                "converted_snapshot": str(analysis / "selected_snapshot" / "selected.h5"),
+                "bfield_slice_directory": str(analysis / "bfield_slices"),
+            }
+            with mock.patch.object(pipeline, "run_directory", return_value=run_dir), \
+                 mock.patch.object(pipeline, "analyze") as analyze, \
+                 mock.patch.object(
+                     pipeline, "postprocess_selected_snapshot", return_value=products
+                 ) as postprocess:
+                outputs = pipeline.convert(cfg)
+            analyze.assert_not_called()
+            postprocess.assert_called_once()
+            self.assertIn(Path(products["selected_athdf"]), outputs)
+
+    def test_timeout_reaps_process_and_preserves_clear_error(self):
+        cfg = example_config()
+        with self.assertRaisesRegex(pipeline.RunTimeoutError, "process group was terminated"):
+            pipeline.run_backend(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                ROOT,
+                cfg,
+                timeout_seconds=0.05,
+            )
+
+    def test_forcing_overlay_provenance_is_pinned(self):
+        overlay = (ROOT / "scripts" / "apply_athenak_forcing_overlay.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("572f644f3ab3379a32ea2f0bec1658348141dc19", overlay)
+        self.assertIn("beta[stage-1] * dt", overlay)
+        self.assertIn("dt_turb_update", overlay)
+
+    def test_preflight_parity_threshold(self):
+        common = {
+            "finite": True, "minimum_density": 0.9, "mass_drift": 1.0e-7,
+            "timestep_collapse": 2.0, "final_time": 0.1, "final_cycle": 20,
+            "tlim": 0.1, "nlim": 5000, "kinetic_energy_density": 1.0,
+            "magnetic_energy_density": 2.0, "alfvenic_mach_magnetic": 0.5,
+        }
+        fp32 = dict(common)
+        fp64 = dict(common, kinetic_energy_density=1.04)
+        self.assertTrue(preflight.validate(fp32, fp64)["passed"])
+        fp64["kinetic_energy_density"] = 1.10
+        self.assertFalse(preflight.validate(fp32, fp64)["passed"])
 
 
 if __name__ == "__main__":

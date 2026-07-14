@@ -4,7 +4,7 @@ This repository is a configurable driver for three-dimensional, compressible MHD
 
 ## Simulation
 
-The supplied problem generators initialize a periodic cube with uniform density, zero velocity, and a divergence-free uniform three-component magnetic guide field. Athena++ supports its configurable forcing mixture. AthenaK's native OU driver is purely solenoidal, so the AthenaK adapter requires `solenoidal_fraction = 1.0` rather than silently changing the physics.
+The supplied problem generators initialize a periodic cube with uniform density, zero velocity, and a divergence-free uniform three-component magnetic guide field. The AthenaK build applies a hash-verified overlay derived from upstream `turb_fix` commit `572f644f3ab3379a32ea2f0bec1658348141dc19`: OU innovations are generated only at `drive_interval`, the final acceleration is momentum-corrected and normalized once, and it is held fixed through RK sub-stages.
 
 ## Setup
 
@@ -43,7 +43,7 @@ python scripts/pipeline.py analyze --config configs/local.toml
 
 Select a backend in `[execution]` with `solver = "athena++"` or `solver = "athenak"`, or override it per invocation with `--solver`. The Athena++ build remains unchanged: it copies the configured source into `build/athena/`, configures FFTW/HDF5/MHD and MPI/OpenMP, and compiles it. Its narrow x86 `_Float16` compatibility correction is still applied only to that disposable copy.
 
-The AthenaK build verifies the external checkout revision and Kokkos submodule, copies the tree below `athenak_build_dir/source`, installs `solver/athenak_mhd_turbulence.cpp`, and builds out of source below `athenak_build_dir/build`. CPU builds enable `Kokkos_ARCH_NATIVE`. CUDA builds enable `Kokkos_ENABLE_CUDA`, select `kokkos_arch`, and use Kokkos' `nvcc_wrapper`. Neither external source checkout is modified.
+The AthenaK build verifies the external checkout revision and Kokkos submodule, copies the tree below `athenak_build_dir/source`, installs `solver/athenak_mhd_turbulence.cpp`, applies the repository-owned forcing overlay, verifies its expected SHA256, and builds out of source below `athenak_build_dir/build`. CPU builds enable `Kokkos_ARCH_NATIVE`. CUDA builds enable `Kokkos_ENABLE_CUDA`, select `kokkos_arch`, and use Kokkos' `nvcc_wrapper`. Neither external source checkout is modified.
 
 ## Configuration
 
@@ -62,7 +62,8 @@ The tracked [example configuration](configs/example.toml) is a 256^3, 16-rank MP
 - `threads`: OpenMP threads and parallel build jobs. Hybrid runs require both MPI and OpenMP at build time.
 - `[athenak].device`: `cpu` or `cuda`; CUDA also requires a nonempty machine-local `kokkos_arch` such as `AMPERE80`.
 - `[athenak].integrator = "rk2"` and `reconstruction = "plm"`: the supported second-order counterparts to Athena++ `vl2` and second-order reconstruction.
-- `[athenak].nlow = 2` and `nhigh = 3`: AthenaK includes its shell endpoints, mapping the Athena++ `1 < |k| < 4` band.
+- AthenaK includes forcing-shell endpoints, so shared exclusive `forcing.nlow`/`nhigh` bounds are translated to `nlow + 1` and `nhigh - 1`; do not duplicate the band under `[athenak]`.
+- `execution.simulation_timeout`: optional process-group wall-time limit, capped at two hours. Timeout sends TERM, waits 30 seconds, then sends KILL while preserving partial output.
 
 Athena++ distributes MeshBlocks across ranks and threads, so configure enough MeshBlocks to keep every worker occupied. The example uses 512 MeshBlocks, giving 32 blocks per rank with 16 MPI ranks.
 
@@ -74,11 +75,11 @@ Each run is written below `output_root/run_name/`. The default AthenaK name is s
 - `bin/*.bin`: AthenaK's shared `mhd_w_bcc` snapshots (AthenaK only).
 - `*.rst`: restart files.
 - `*.hst`: volume-averaged history.
-- `analysis/velocity_slices/*.png`: velocity magnitude plus in-plane arrows for every snapshot.
 - `analysis/energy_history.png`: kinetic, fluctuating magnetic, turbulent, and total magnetic energy histories.
 - `analysis/diagnostics.csv`: scalar diagnostics by snapshot.
 - `analysis/diagnostics.json`: formulas, saturation assessment, $M_s$, two $M_A$ estimators, field statistics, plasma beta, and energies.
-- `analysis/selected_snapshot/*.h5`: the selected saturated snapshot converted to contiguous cubes.
+- `analysis/selected_snapshot/*.athdf`: the selected AthenaK snapshot retained for provenance.
+- `analysis/selected_snapshot/*.h5`: only the selected snapshot converted to contiguous cubes.
 - `analysis/bfield_slices/*.png`: three orthogonal magnetic slices from the selected snapshot.
 
 The primary definitions are
@@ -89,11 +90,11 @@ M_A = \frac{v_{rms,\rho}}{|\langle B\rangle|/\sqrt{\langle\rho\rangle}}, \qquad
 M_{A,B}=\frac{\delta B_{rms}}{|\langle B\rangle|}.
 \]
 
-The final 25% of usable history samples is the candidate saturation window. The pipeline first requires less than 10% fitted turbulent-energy change across that window. It then considers only `.athdf` snapshots whose stored Athena time is inside the accepted window and minimizes absolute error against the configured target. `metric = "ms"` uses $M_s$; `metric = "ma"` uses $M_{A,B}$. If saturation is false or inconclusive, or if no snapshot is inside the window, analysis records the failure in `diagnostics.json` and exits without selected-snapshot conversion or magnetic-slice generation.
+The final 25% of usable history samples is the candidate saturation window. The pipeline requires less than 10% fitted turbulent-energy change there and at least `5 × tcorr` elapsed time. It considers only snapshots inside the accepted window and minimizes absolute target error, with later-time tie breaking and no target tolerance. `metric = "ms"` uses $M_s$; `metric = "ma"` uses $M_{A,B}$. If saturation is false or inconclusive, or if no snapshot is inside the window, analysis records the failure in `diagnostics.json` and exits without selected-snapshot conversion or magnetic-slice generation.
 
-AthenaK binary conversion is block-streaming and atomic: data are written to a temporary HDF5 file and published only after the full level-zero grid validates. The resulting `<run>.out2.<number>.athdf` contains the same `prim`/`B` datasets, coordinates, attributes, variable names, and MeshBlock metadata consumed by the existing diagnostics and `ath2h5.jl`. Conversion runs automatically after a successful AthenaK simulation; the explicit `convert` command is idempotent recovery for interrupted or manually copied outputs. AMR, sliced/ghost-zone output, and one-file-per-rank binaries are rejected.
+AthenaK diagnostics stream directly from every shared `.bin`; Athena++ diagnostics read `.athdf` directly. `run` writes solver output only. After selection, exactly one AthenaK `.bin` is atomically materialized as `.athdf`, retained for provenance, and converted to `.h5`. The explicit `convert` command reuses valid selection metadata or performs diagnostics and selection first. `all` executes `build → run → analyze`. AMR, sliced/ghost-zone output, and one-file-per-rank binaries are rejected.
 
-AthenaK's pinned native driver advances forcing every solver timestep and initializes its own RNG state. Accordingly, the Athena++ controls `forcing.drive_interval` and `forcing.random_seed` do not apply to AthenaK; this is recorded in `solver_metadata.json` and copied into `analysis/diagnostics.json`.
+The AthenaK mapping recorded in `solver_metadata.json` is explicit: `mode → turb_flag`, `energy_injection_rate → dedt`, `correlation_time → tcorr`, `drive_interval → dt_turb_update`, `solenoidal_fraction → sol_fraction`, `random_seed → random_seed`, and `spectrum_exponent → expo` with `spect_form = 2` and isotropic `driving_type = 0`.
 
 Only tune $M_A$ from a run that the saturation diagnostic accepts. A useful next iteration is
 

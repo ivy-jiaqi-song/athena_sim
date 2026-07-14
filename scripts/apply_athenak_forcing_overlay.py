@@ -24,6 +24,7 @@ EXPECTED_INPUTS = {
     "src/eos/primitive-solver/piecewise_polytrope.cpp": "6485e394912c2bee5bdc1f69b81e85b7d24eaf6d787ef3e22f642b9bec788ac0",
     "src/eos/primitive-solver/eos_hybrid.cpp": "cac75ea87c536c27d3d54e901a6f4fbcd7e24283f994505ab3fb183f24312d3a",
     "src/eos/primitive-solver/eos_compose.cpp": "9e5791b6b326322f27852311626bd586daf91e7f93f2e36bc82fe9bbbcc6ffd8",
+    "src/pgen/unit_tests/gauss_legendre.cpp": "eadd0ea2b768d36dfdf51730756adcce0459ea584f01dcaf603f1902c6e52499",
 }
 
 
@@ -273,6 +274,15 @@ def _patch_piecewise_polytrope(text: str) -> str:
     )
 
 
+def _patch_gauss_legendre(text: str) -> str:
+    return _replace_once(
+        text,
+        "  double ylmR1,ylmI1,ylmR2,ylmI2;",
+        "  Real ylmR1,ylmI1,ylmR2,ylmI2;",
+        "spherical-harmonic output storage",
+    )
+
+
 def apply_overlay(source_root: str | Path) -> str:
     root = Path(source_root)
     originals = {relative: _read_verified(root, relative) for relative in EXPECTED_INPUTS}
@@ -294,6 +304,9 @@ def apply_overlay(source_root: str | Path) -> str:
         ),
         "src/eos/primitive-solver/eos_compose.cpp": _patch_table_reader_pointers(
             originals["src/eos/primitive-solver/eos_compose.cpp"]
+        ),
+        "src/pgen/unit_tests/gauss_legendre.cpp": _patch_gauss_legendre(
+            originals["src/pgen/unit_tests/gauss_legendre.cpp"]
         ),
     }
     digest = hashlib.sha256()

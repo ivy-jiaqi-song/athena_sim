@@ -134,8 +134,10 @@ def _patch_driver(text: str) -> str:
         "  // Evolve the retained OU acceleration only on configured update boundaries.\n"
         "  auto force_ = force;\n"
         "  const Real fcorr = (n_turb_updates == 0 || tcorr <= 1.0e-6)\n"
-        "                         ? 0.0 : std::exp(-dt_turb_update/tcorr);\n"
-        "  const Real gcorr = std::sqrt(std::max(0.0, 1.0 - fcorr*fcorr));\n"
+        "                         ? static_cast<Real>(0.0)\n"
+        "                         : static_cast<Real>(std::exp(-dt_turb_update/tcorr));\n"
+        "  const Real gcorr = std::sqrt(std::max(static_cast<Real>(0.0),\n"
+        "      static_cast<Real>(1.0) - fcorr*fcorr));\n"
         "  par_for(\"force_OU_update\", DevExeSpace(),0,nmb-1,0,2,ks,ke,js,je,is,ie,\n"
         "  KOKKOS_LAMBDA(int m, int n, int k, int j, int i) {\n"
         "    force_(m,n,k,j,i) = fcorr*force_(m,n,k,j,i) +\n"
@@ -145,6 +147,10 @@ def _patch_driver(text: str) -> str:
         "OU retained-force update",
     )
     tail = tail.replace("  t1 = std::max(t1, 1.0e-20);\n", "")
+    tail = tail.replace(
+        "std::max(t0, 1.0e-20)",
+        "std::max(t0, static_cast<Real>(1.0e-20))",
+    )
     tail = _replace_once(
         tail,
         "  return TaskStatus::complete;\n}\n\n",

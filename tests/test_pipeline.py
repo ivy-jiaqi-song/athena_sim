@@ -346,6 +346,12 @@ class HarrisWorkflowTests(unittest.TestCase):
             pipeline.ATHENAK_FORCING_OVERLAY_SHA256,
             "769352f948ec26934db7df8ea4933d99a25fe8bb459909a523aa8923d750ba8f",
         )
+        particle_overlay = (ROOT / "scripts" / "apply_athenak_particle_overlay.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("tracked_particle_counter", particle_overlay)
+        self.assertIn("6*sizeof(float)*outpart(p).tag", particle_overlay)
+        self.assertIn("&(data[6*p])", particle_overlay)
 
 
 if __name__ == "__main__":

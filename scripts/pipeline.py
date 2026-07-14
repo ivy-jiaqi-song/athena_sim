@@ -307,6 +307,18 @@ def _load_forcing_overlay() -> Any:
     return module
 
 
+def _load_particle_overlay() -> Any:
+    import importlib.util
+
+    path = ROOT / "scripts" / "apply_athenak_particle_overlay.py"
+    spec = importlib.util.spec_from_file_location("apply_athenak_particle_overlay", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load AthenaK particle overlay at {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def prepare_athenak_build_tree(cfg: dict[str, Any], clean: bool) -> tuple[Path, Path]:
     external_source = project_path(cfg["paths"]["athenak_source"])
     expected_revision = str(cfg["athenak"].get("revision", ATHENAK_REVISION)).strip()
@@ -355,6 +367,19 @@ def prepare_athenak_build_tree(cfg: dict[str, Any], clean: bool) -> tuple[Path, 
             f"{ATHENAK_FORCING_OVERLAY_SHA256}"
         )
     print(f"[pipeline] AthenaK forcing overlay {overlay.UPSTREAM_COMMIT} SHA256={overlay_hash}")
+    particle_overlay = _load_particle_overlay()
+    particle_record = root / "particle_overlay.json"
+    if not particle_record.is_file():
+        particle_hash = particle_overlay.apply_overlay(source_copy)
+        particle_record.write_text(json.dumps({
+            "input_sha256": particle_overlay.INPUT_SHA256,
+            "overlay_sha256": particle_hash,
+        }, indent=2), encoding="utf-8")
+    else:
+        particle_hash = json.loads(
+            particle_record.read_text(encoding="utf-8")
+        )["overlay_sha256"]
+    print(f"[pipeline] AthenaK particle overlay SHA256={particle_hash}")
     cmake_build.mkdir(parents=True, exist_ok=True)
     return source_copy, cmake_build
 

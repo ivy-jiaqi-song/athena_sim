@@ -2,8 +2,8 @@
 athena_source = "unused"
 build_dir = "build/unused"
 athenak_source = "/home/user0001/apps/athenak-main"
-athenak_build_dir = "build/athenak-cuda-harris-sheet"
-output_root = "/home/user0001/MHDFlows_replicate/outputs/hs_sim"
+athenak_build_dir = "build/athenak-cuda-harris-sheet-preflight-fp32"
+output_root = "/home/user0001/MHDFlows_replicate/outputs/hs_sim_tests"
 
 [execution]
 solver = "athenak"
@@ -31,11 +31,11 @@ integrator = "rk2"
 reconstruction = "plm"
 
 [simulation]
-run_name = "harris_sheet_cuda_n256"
-resolution = 256
+run_name = "harris_sheet_cuda_n64_preflight_fp32"
+resolution = 64
 meshblock = 32
 box_length = 1.0
-tlim = 0.5
+tlim = 0.1
 nlim = 5000
 cfl = 0.30
 rho0 = 1.0
@@ -57,10 +57,11 @@ track_interval = 0.02
 vtk_interval = 0.10
 
 [output]
-history_interval = 0.02
-snapshot_interval = 0.10
+history_interval = 0.01
+snapshot_interval = 0.02
 restart_interval = 1.0
 slice_axis = "x3"
 slice_index = -1
 quiver_stride = 8
 snapshot_policy = "peak_current"
+

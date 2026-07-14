@@ -6,6 +6,9 @@ configs/*.toml
 !configs/athenak-gpu-ma08.toml
 !configs/harris-sheet-athenapp.toml
 !configs/harris-sheet-athenak-gpu.toml
+!configs/harris-sheet-athenak-gpu-preflight-fp32.toml
+!configs/harris-sheet-athenak-gpu-preflight-fp64.toml
+!configs/harris-sheet-athenak-particle-smoke.toml
 
 # Disposable Athena++ build and simulation products.
 build/

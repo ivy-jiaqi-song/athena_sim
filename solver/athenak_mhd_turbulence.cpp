@@ -1,6 +1,7 @@
 // AthenaK problem generator for an isothermal Harris Sheet MHD test.
 // Installed into a disposable pinned AthenaK source copy by scripts/pipeline.py.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -58,6 +59,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const Real l2 = x2max - x2min;
   const Real l3 = x3max - x3min;
   const Real two_pi = 2.0 * std::acos(-1.0);
+  const Real sheet_scale = two_pi * sheet_width / l2;
 
   par_for("pgen_harris_sheet", DevExeSpace(), 0, nmb - 1,
           ks, ke, js, je, is, ie,
@@ -65,7 +67,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const Real x1 = mbsize.d_view(m).x1min + (static_cast<Real>(i - is) + 0.5) * mbsize.d_view(m).dx1;
     const Real x2 = mbsize.d_view(m).x2min + (static_cast<Real>(j - js) + 0.5) * mbsize.d_view(m).dx2;
     const Real x3 = mbsize.d_view(m).x3min + (static_cast<Real>(k - ks) + 0.5) * mbsize.d_view(m).dx3;
-    const Real b1 = b0_amp * tanh(sin(two_pi * x2 / l2) / sheet_width);
+    const Real b1 = b0_amp * tanh(sin(two_pi * x2 / l2) / sheet_scale);
     const Real density = rho0 + 0.5 * (b0_amp*b0_amp - b1*b1) / (sound_speed*sound_speed);
     const Real vx = noise_amplitude * sin(two_pi * x1 / l1) * sin(two_pi * x2 / l2);
     const Real vy = noise_amplitude * cos(two_pi * x1 / l1) * sin(two_pi * x3 / l3);
@@ -114,5 +116,10 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pi(PTAG, p) = p;
       rand_pool64.free_state(rand_gen);
     });
+    // Match AthenaK's built-in uniform-mesh particle generator. The drift
+    // pusher otherwise has no finite timestep after custom initialization.
+    Real &dtnew_ = pmbp->ppart->dtnew;
+    dtnew_ = std::min(mbsize.h_view(0).dx1, mbsize.h_view(0).dx2);
+    dtnew_ = std::min(dtnew_, mbsize.h_view(0).dx3);
   }
 }

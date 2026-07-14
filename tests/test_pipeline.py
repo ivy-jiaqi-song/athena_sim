@@ -4,6 +4,7 @@ import importlib.util
 import struct
 import sys
 import tempfile
+import json
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -27,6 +28,9 @@ def load_module(name: str, path: Path):
 pipeline = load_module("pipeline", ROOT / "scripts" / "pipeline.py")
 bfield = load_module("make_bfield_slices", ROOT / "scripts" / "make_bfield_slices.py")
 converter = load_module("athenak_to_athdf", ROOT / "scripts" / "athenak_to_athdf.py")
+harris_preflight = load_module(
+    "validate_harris_preflight", ROOT / "scripts" / "validate_harris_preflight.py"
+)
 
 
 def example_config(solver: str = "athena++"):
@@ -185,6 +189,11 @@ class AthenaKConverterTests(unittest.TestCase):
             np.testing.assert_allclose(diagnostics["mean_magnetic_field"], [1.0, 0.25, -0.5])
             velocity_slice = pipeline.extract_velocity_slice(destination, "x3", 0)
             self.assertEqual(velocity_slice["velocity"][0].shape, (2, 4))
+            raw = pipeline.athenak_snapshot_diagnostics(source, 0.75)
+            self.assertEqual(raw["source_filename"], source.name)
+            self.assertAlmostEqual(raw["mean_density"], 1.5)
+            self.assertTrue(raw["finite_state"])
+            self.assertTrue(np.isfinite(raw["max_abs_current_j3_proxy"]))
 
 
 class SelectionTests(unittest.TestCase):
@@ -261,6 +270,82 @@ class BFieldSliceTests(unittest.TestCase):
                 for name, config in bfield.SLICES.items()
             ]
             self.assertTrue(all(path.is_file() for path in outputs))
+
+
+class HarrisWorkflowTests(unittest.TestCase):
+    def test_physical_half_thickness_and_particle_timestep(self):
+        source = (ROOT / "solver" / "athenak_mhd_turbulence.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("sheet_scale = two_pi * sheet_width / l2", source)
+        self.assertIn("pmbp->ppart->dtnew", source)
+        self.assertIn("std::min(mbsize.h_view(0).dx1", source)
+        self.assertAlmostEqual(256 * 0.05, 12.8)
+
+    def test_production_config_is_fp32_particle_free_and_bounded(self):
+        cfg = pipeline.load_config(ROOT / "configs" / "harris-sheet-athenak-gpu.toml")
+        self.assertTrue(cfg["build"]["single_precision"])
+        self.assertFalse(cfg["particles"]["enabled"])
+        self.assertEqual(cfg["simulation"]["nlim"], 5000)
+        self.assertEqual(cfg["execution"]["simulation_timeout"], 6600)
+
+    def test_timeout_reaps_process_and_preserves_clear_error(self):
+        cfg = example_config()
+        with self.assertRaisesRegex(pipeline.RunTimeoutError, "process group was terminated"):
+            pipeline.run_backend(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                ROOT,
+                cfg,
+                timeout_seconds=0.05,
+            )
+
+    def test_convert_reuses_peak_current_selection(self):
+        cfg = example_config("athenak")
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = Path(temporary)
+            analysis = run_dir / "analysis"
+            analysis.mkdir()
+            summary = {"snapshot_selection": {"snapshot": {"file": "bin/selected.bin"}}}
+            (analysis / "diagnostics.json").write_text(json.dumps(summary), encoding="utf-8")
+            products = {
+                "source_snapshot": str(run_dir / "bin" / "selected.bin"),
+                "selected_athdf": str(analysis / "selected_snapshot" / "selected.athdf"),
+                "converted_snapshot": str(analysis / "selected_snapshot" / "selected.h5"),
+                "bfield_slice_directory": str(analysis / "bfield_slices"),
+            }
+            with mock.patch.object(pipeline, "run_directory", return_value=run_dir), \
+                 mock.patch.object(pipeline, "analyze") as analyze, \
+                 mock.patch.object(
+                     pipeline, "postprocess_selected_snapshot", return_value=products
+                 ) as postprocess:
+                outputs = pipeline.convert(cfg)
+            analyze.assert_not_called()
+            postprocess.assert_called_once()
+            self.assertIn(Path(products["selected_athdf"]), outputs)
+
+    def test_harris_preflight_parity_threshold(self):
+        common = {
+            "finite": True, "minimum_density": 0.9, "mass_drift": 1.0e-7,
+            "timestep_collapse": 2.0, "field_reversal_preserved": True,
+            "finite_current_proxy": True, "final_time": 0.1, "final_cycle": 20,
+            "tlim": 0.1, "nlim": 5000, "kinetic_energy_density": 1.0,
+            "magnetic_energy_density": 2.0, "harris_reversal_contrast": 1.9,
+            "max_abs_current_j3_proxy": 20.0,
+        }
+        fp64 = dict(common, kinetic_energy_density=1.04)
+        self.assertTrue(harris_preflight.validate(common, fp64)["passed"])
+        fp64["kinetic_energy_density"] = 1.10
+        self.assertFalse(harris_preflight.validate(common, fp64)["passed"])
+
+    def test_overlay_provenance_is_pinned(self):
+        overlay = (ROOT / "scripts" / "apply_athenak_forcing_overlay.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("572f644f3ab3379a32ea2f0bec1658348141dc19", overlay)
+        self.assertEqual(
+            pipeline.ATHENAK_FORCING_OVERLAY_SHA256,
+            "769352f948ec26934db7df8ea4933d99a25fe8bb459909a523aa8923d750ba8f",
+        )
 
 
 if __name__ == "__main__":

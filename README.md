@@ -21,11 +21,24 @@ python scripts/pipeline.py convert --config configs/harris-sheet-athenak-gpu.tom
 python scripts/pipeline.py analyze --config configs/harris-sheet-athenak-gpu.toml
 ```
 
+`run` writes simulation outputs only. `analyze` streams AthenaK `.bin` snapshots
+directly (Athena++ `.athdf` snapshots directly), selects the absolute peak-current
+snapshot, and materializes only that selected AthenaK snapshot. `convert` reuses
+existing selection metadata or performs diagnostics and selection first. `all`
+runs `build -> run -> analyze` without a bulk conversion stage.
+
+Before production, build and run the tracked N=64 FP32/FP64 fluid preflights and
+validate them with `scripts/validate_harris_preflight.py`. The dedicated N=32
+particle smoke config contains 1,024 zero-velocity drift particles and validates
+allocation, ownership, tracking, and output plumbing only.
+
 ## Configuration
 
 Tracked Harris Sheet examples are:
 
 - `configs/harris-sheet-athenak-gpu.toml`: CUDA AthenaK run, writing below `/home/user0001/MHDFlows_replicate/outputs/hs_sim`.
+- `configs/harris-sheet-athenak-gpu-preflight-fp32.toml` and `-fp64.toml`: particle-free N=64 parity runs.
+- `configs/harris-sheet-athenak-particle-smoke.toml`: N=32 particle plumbing smoke run.
 - `configs/harris-sheet-athenapp.toml`: Athena++ parity config for local/CPU environments.
 
 Important controls:
@@ -33,7 +46,7 @@ Important controls:
 - `simulation.resolution`, `meshblock`, `box_length`, `tlim`, `sound_speed`, `rho0`.
 - `harris_sheet.b0`: reversing tangential field amplitude.
 - `harris_sheet.guide_b3`: optional guide field.
-- `harris_sheet.sheet_width`: current-sheet thickness parameter.
+- `harris_sheet.sheet_width`: physical Harris half-thickness; the periodic double-sheet field is `B1 = b0*tanh(sin(2*pi*x2/L)/(2*pi*sheet_width/L))`.
 - `harris_sheet.noise_amplitude`: small initial velocity perturbation.
 - `output.snapshot_policy`: `final`, `peak_kinetic`, or `peak_current` for selecting the snapshot converted to `.h5` and B-field slices.
 - AthenaK-only `particles.enabled`: center-injected tracked particles for a non-feedback trajectory sanity check.
@@ -42,7 +55,7 @@ Important controls:
 
 Each run is written below `output_root/run_name/`. AthenaK appends `_athenak` to the run name.
 
-- `*.athdf`: primitive-variable snapshots.
+- `analysis/selected_snapshot/*.athdf`: the one selected AthenaK snapshot retained for provenance (Athena++ sources remain in place).
 - `bin/*.bin`: AthenaK shared `mhd_w_bcc` snapshots.
 - `*.hst`: volume-averaged history.
 - `trk/*.trk`: AthenaK tracked particle trajectory records when particles are enabled.

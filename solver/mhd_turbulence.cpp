@@ -40,6 +40,7 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
   const Real l2 = x2max - x2min;
   const Real l3 = x3max - x3min;
   const Real two_pi = 2.0 * std::acos(-1.0);
+  const Real sheet_scale = two_pi * sheet_width / l2;
 
   if (rho0 <= 0.0 || pressure0 <= 0.0 || sheet_width <= 0.0 || sound_speed <= 0.0) {
     std::stringstream msg;
@@ -54,7 +55,7 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
     for (int j = js; j <= je; ++j) {
       for (int i = is; i <= ie + 1; ++i) {
         const Real x2 = pcoord->x2v(j);
-        pfield->b.x1f(k, j, i) = b0 * std::tanh(std::sin(two_pi * x2 / l2) / sheet_width);
+        pfield->b.x1f(k, j, i) = b0 * std::tanh(std::sin(two_pi * x2 / l2) / sheet_scale);
       }
     }
   }
@@ -79,7 +80,7 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
         const Real x1 = pcoord->x1v(i);
         const Real x2 = pcoord->x2v(j);
         const Real x3 = pcoord->x3v(k);
-        const Real b1 = b0 * std::tanh(std::sin(two_pi * x2 / l2) / sheet_width);
+        const Real b1 = b0 * std::tanh(std::sin(two_pi * x2 / l2) / sheet_scale);
         const Real density = rho0 + 0.5 * (b0*b0 - b1*b1) / (sound_speed*sound_speed);
         const Real vx = noise_amplitude * std::sin(two_pi * x1 / l1) * std::sin(two_pi * x2 / l2);
         const Real vy = noise_amplitude * std::cos(two_pi * x1 / l1) * std::sin(two_pi * x3 / l3);

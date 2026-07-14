@@ -319,6 +319,8 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertIn("572f644f3ab3379a32ea2f0bec1658348141dc19", overlay)
         self.assertIn("beta[stage-1] * dt", overlay)
         self.assertIn("dt_turb_update", overlay)
+        self.assertIn("double * table_", overlay)
+        self.assertIn("static_cast<Real>", overlay)
 
     def test_preflight_parity_threshold(self):
         common = {

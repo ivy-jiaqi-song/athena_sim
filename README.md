@@ -43,7 +43,7 @@ python scripts/pipeline.py analyze --config configs/local.toml
 
 Select a backend in `[execution]` with `solver = "athena++"` or `solver = "athenak"`, or override it per invocation with `--solver`. The Athena++ build remains unchanged: it copies the configured source into `build/athena/`, configures FFTW/HDF5/MHD and MPI/OpenMP, and compiles it. Its narrow x86 `_Float16` compatibility correction is still applied only to that disposable copy.
 
-The AthenaK build verifies the external checkout revision and Kokkos submodule, copies the tree below `athenak_build_dir/source`, installs `solver/athenak_mhd_turbulence.cpp`, applies the repository-owned forcing overlay, verifies its expected SHA256, and builds out of source below `athenak_build_dir/build`. CPU builds enable `Kokkos_ARCH_NATIVE`. CUDA builds enable `Kokkos_ENABLE_CUDA`, select `kokkos_arch`, and use Kokkos' `nvcc_wrapper`. Neither external source checkout is modified.
+The AthenaK build verifies the external checkout revision and Kokkos submodule, copies the tree below `athenak_build_dir/source`, installs `solver/athenak_mhd_turbulence.cpp`, applies the repository-owned forcing overlay plus narrow archived-source FP32 `Real` compatibility corrections, verifies the expected SHA256, and builds out of source below `athenak_build_dir/build`. CPU builds enable `Kokkos_ARCH_NATIVE`. CUDA builds enable `Kokkos_ENABLE_CUDA`, select `kokkos_arch`, and use Kokkos' `nvcc_wrapper`. Neither external source checkout is modified.
 
 ## Configuration
 

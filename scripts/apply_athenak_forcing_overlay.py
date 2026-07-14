@@ -19,6 +19,11 @@ EXPECTED_INPUTS = {
     "src/srcterms/turb_driver.cpp": "840a8d37e9a18c42cc3e4374b6e4ffd0c668e4d74b5a36b01279cef45b839074",
     "src/srcterms/turb_driver.hpp": "41491a1d95396568d53676b7e3e737b901acb5e29db9286425c21e88c7825042",
     "src/mesh/mesh.cpp": "5fecb389b6912c858defac1436980094ad49e1f9c355b7862cf1cde7f8fa06c2",
+    "src/eos/primitive-solver/unit_system.cpp": "2e5dd03cefd8c629a24b7f7757e5262c8241b370dbb216cb3ca13228a2eaf14b",
+    "src/eos/primitive-solver/unit_system.hpp": "ca162024bfe96a5abe02f8dcc5602add9e8c912be17a30bd46cd68b373fbb280",
+    "src/eos/primitive-solver/piecewise_polytrope.cpp": "6485e394912c2bee5bdc1f69b81e85b7d24eaf6d787ef3e22f642b9bec788ac0",
+    "src/eos/primitive-solver/eos_hybrid.cpp": "cac75ea87c536c27d3d54e901a6f4fbcd7e24283f994505ab3fb183f24312d3a",
+    "src/eos/primitive-solver/eos_compose.cpp": "9e5791b6b326322f27852311626bd586daf91e7f93f2e36bc82fe9bbbcc6ffd8",
 }
 
 
@@ -216,6 +221,57 @@ def _patch_mesh(text: str) -> str:
     return text
 
 
+def _patch_unit_initializers(text: str) -> str:
+    """Make aggregate unit constants explicit Real conversions for FP32 nvcc."""
+    result: list[str] = []
+    inside = False
+    wrapped = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("return UnitSystem{") or stripped.startswith("static UnitSystem CGS{"):
+            inside = True
+            result.append(line)
+            continue
+        if inside and stripped == "};":
+            inside = False
+            result.append(line)
+            continue
+        if inside and stripped and not stripped.startswith("//"):
+            newline = "\n" if line.endswith("\n") else ""
+            body = line[:-1] if newline else line
+            code, marker, comment = body.partition("//")
+            if code.rstrip().endswith(","):
+                indent = code[: len(code) - len(code.lstrip())]
+                expression = code.strip()[:-1]
+                body = f"{indent}static_cast<Real>({expression}),"
+                if marker:
+                    body += f" //{comment}"
+                line = body + newline
+                wrapped += 1
+        result.append(line)
+    if wrapped < 13:
+        raise RuntimeError(f"Expected FP32 unit initializers; wrapped only {wrapped}")
+    return "".join(result)
+
+
+def _patch_table_reader_pointers(text: str) -> str:
+    count = text.count("Real * table_")
+    if count == 0:
+        raise RuntimeError("Expected TableReader pointers for FP32 compatibility")
+    return text.replace("Real * table_", "double * table_")
+
+
+def _patch_piecewise_polytrope(text: str) -> str:
+    text = _replace_once(
+        text, "  double densities[MAX_PIECES+1];", "  Real densities[MAX_PIECES+1];",
+        "piecewise density array",
+    )
+    return _replace_once(
+        text, "  double gammas[MAX_PIECES+1];", "  Real gammas[MAX_PIECES+1];",
+        "piecewise gamma array",
+    )
+
+
 def apply_overlay(source_root: str | Path) -> str:
     root = Path(source_root)
     originals = {relative: _read_verified(root, relative) for relative in EXPECTED_INPUTS}
@@ -223,6 +279,21 @@ def apply_overlay(source_root: str | Path) -> str:
         "src/srcterms/turb_driver.cpp": _patch_driver(originals["src/srcterms/turb_driver.cpp"]),
         "src/srcterms/turb_driver.hpp": _patch_header(originals["src/srcterms/turb_driver.hpp"]),
         "src/mesh/mesh.cpp": _patch_mesh(originals["src/mesh/mesh.cpp"]),
+        "src/eos/primitive-solver/unit_system.cpp": _patch_unit_initializers(
+            originals["src/eos/primitive-solver/unit_system.cpp"]
+        ),
+        "src/eos/primitive-solver/unit_system.hpp": _patch_unit_initializers(
+            originals["src/eos/primitive-solver/unit_system.hpp"]
+        ),
+        "src/eos/primitive-solver/piecewise_polytrope.cpp": _patch_piecewise_polytrope(
+            originals["src/eos/primitive-solver/piecewise_polytrope.cpp"]
+        ),
+        "src/eos/primitive-solver/eos_hybrid.cpp": _patch_table_reader_pointers(
+            originals["src/eos/primitive-solver/eos_hybrid.cpp"]
+        ),
+        "src/eos/primitive-solver/eos_compose.cpp": _patch_table_reader_pointers(
+            originals["src/eos/primitive-solver/eos_compose.cpp"]
+        ),
     }
     digest = hashlib.sha256()
     for relative in sorted(patched):

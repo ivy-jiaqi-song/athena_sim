@@ -1,85 +1,68 @@
-# Athena++ driven MHD turbulence
+# Athena++ / AthenaK Harris Sheet MHD
 
-This repository is a configurable driver for three-dimensional, compressible MHD turbulence simulations with Athena++. It copies an external Athena++ source tree into a disposable local build, installs the custom problem generator, runs the simulation, and analyzes every HDF5 snapshot.
-
-## Simulation
-
-The supplied problem generator initializes a periodic cube with uniform density, zero velocity, and a divergence-free uniform magnetic guide field. Athena++ then drives compressible turbulence over configurable Fourier modes with a configurable mixture of solenoidal and compressive forcing.
+This repository drives a three-dimensional isothermal Harris Sheet simulation with Athena++ or the GPU-ready AthenaK/Kokkos backend. The initialized box is periodic and split into upper/lower magnetic-field domains by a current sheet at `x2=0`: `B1` reverses sign across the sheet, `B2=0`, and `B3` is an optional guide field. A small deterministic velocity perturbation seeds the collapse/tearing dynamics while the run remains in the fluid MHD regime.
 
 ## Setup
 
-Requirements are Python 3.11+, NumPy, h5py, Matplotlib, Athena++ source, and a Linux dependency prefix containing a C++ compiler, FFTW, and HDF5. MPI runs additionally require OpenMPI, an MPI compiler, and MPI-enabled FFTW/HDF5.
+Requirements are Python 3.11+, NumPy, h5py, Matplotlib, Julia 1.10+, and a Linux C++17 build environment. Athena++ additionally needs FFTW and HDF5. AthenaK needs CMake and a recursive AthenaK checkout; CUDA builds need the CUDA toolkit, `nvcc`, and a Kokkos architecture matching the local NVIDIA GPU. MPI runs additionally require OpenMPI and an MPI compiler.
 
-Create a machine-local configuration after cloning:
-
-```bash
-cp configs/example.toml configs/local.toml
-```
-
-`configs/local.toml` is ignored by Git. Update `athena_source`, `dependency_prefix`, `output_root`, MPI resources, and simulation parameters for the machine before running.
-
-Install the Python dependencies and execute all stages:
+Run the full pipeline with a machine-local config:
 
 ```bash
-python -m pip install -r requirements.txt
-python scripts/pipeline.py all --config configs/local.toml --clean --overwrite
+python scripts/pipeline.py all --config configs/harris-sheet-athenak-gpu.toml --clean --overwrite
 ```
 
 Individual stages are also available:
 
 ```bash
-python scripts/pipeline.py build --config configs/local.toml --clean
-python scripts/pipeline.py run --config configs/local.toml --overwrite
-python scripts/pipeline.py analyze --config configs/local.toml
+python scripts/pipeline.py build --config configs/harris-sheet-athenak-gpu.toml --clean
+python scripts/pipeline.py run --config configs/harris-sheet-athenak-gpu.toml --overwrite
+python scripts/pipeline.py convert --config configs/harris-sheet-athenak-gpu.toml
+python scripts/pipeline.py analyze --config configs/harris-sheet-athenak-gpu.toml
 ```
 
-The build stage copies the configured Athena++ source into `build/athena/`, installs the custom problem generator, configures FFTW/HDF5/MHD and the selected MPI/OpenMP modes, and compiles it. The original Athena++ checkout is not changed. The expected Athena++ revision has an x86 FP16 detection defect; the build helper applies the narrow `_Float16` compatibility correction only to the disposable copy.
+`run` writes simulation outputs only. `analyze` streams AthenaK `.bin` snapshots
+directly (Athena++ `.athdf` snapshots directly), selects the absolute peak-current
+snapshot, and materializes only that selected AthenaK snapshot. `convert` reuses
+existing selection metadata or performs diagnostics and selection first. `all`
+runs `build -> run -> analyze` without a bulk conversion stage.
+
+Before production, build and run the tracked N=64 FP32/FP64 fluid preflights and
+validate them with `scripts/validate_harris_preflight.py`. The dedicated N=32
+particle smoke config contains 1,024 zero-velocity drift particles and validates
+allocation, ownership, tracking, and output plumbing only.
 
 ## Configuration
 
-The tracked [example configuration](configs/example.toml) is a 256^3, 16-rank MPI case targeting moderately supersonic turbulence and $M_A\approx0.9$. Important controls are:
+Tracked Harris Sheet examples are:
 
-- `resolution` and `meshblock`: global and per-block cube dimensions.
-- `tlim`: simulation duration in code units.
-- `sound_speed`: sets the sonic Mach-number scale for the isothermal build.
-- `guide_field`: mean magnetic field, normally along x1.
-- `energy_injection_rate`: forcing power.
-- `nlow` and `nhigh`: Athena++ drives only modes satisfying `nlow < |k| < nhigh`.
-- `solenoidal_fraction = 1.0`: purely solenoidal driving.
-- history, snapshot, and restart intervals.
-- `mpi_ranks`: number of MPI processes launched with `mpirun`.
-- `threads`: OpenMP threads and parallel build jobs. Hybrid runs require both MPI and OpenMP at build time.
+- `configs/harris-sheet-athenak-gpu.toml`: CUDA AthenaK run, writing below `/home/user0001/MHDFlows_replicate/outputs/hs_sim`.
+- `configs/harris-sheet-athenak-gpu-preflight-fp32.toml` and `-fp64.toml`: particle-free N=64 parity runs.
+- `configs/harris-sheet-athenak-particle-smoke.toml`: N=32 particle plumbing smoke run.
+- `configs/harris-sheet-athenapp.toml`: Athena++ parity config for local/CPU environments.
 
-Athena++ distributes MeshBlocks across ranks and threads, so configure enough MeshBlocks to keep every worker occupied. The example uses 512 MeshBlocks, giving 32 blocks per rank with 16 MPI ranks.
+Important controls:
 
-## Outputs and diagnostics
+- `simulation.resolution`, `meshblock`, `box_length`, `tlim`, `sound_speed`, `rho0`.
+- `harris_sheet.b0`: reversing tangential field amplitude.
+- `harris_sheet.guide_b3`: optional guide field.
+- `harris_sheet.sheet_width`: physical Harris half-thickness; the periodic double-sheet field is `B1 = b0*tanh(sin(2*pi*x2/L)/(2*pi*sheet_width/L))`.
+- `harris_sheet.noise_amplitude`: small initial velocity perturbation.
+- `output.snapshot_policy`: `final`, `peak_kinetic`, or `peak_current` for selecting the snapshot converted to `.h5` and B-field slices.
+- AthenaK-only `particles.enabled`: center-injected tracked particles for a non-feedback trajectory sanity check.
 
-Each run is written below `output_root/run_name/`:
+## Outputs
 
-- `*.athdf`: primitive-variable snapshots.
-- `*.rst`: restart files.
+Each run is written below `output_root/run_name/`. AthenaK appends `_athenak` to the run name.
+
+- `analysis/selected_snapshot/*.athdf`: the one selected AthenaK snapshot retained for provenance (Athena++ sources remain in place).
+- `bin/*.bin`: AthenaK shared `mhd_w_bcc` snapshots.
 - `*.hst`: volume-averaged history.
-- `analysis/velocity_slices/*.png`: velocity magnitude plus in-plane arrows for every snapshot.
-- `analysis/energy_history.png`: kinetic, fluctuating magnetic, turbulent, and total magnetic energy histories.
-- `analysis/diagnostics.csv`: scalar diagnostics by snapshot.
-- `analysis/diagnostics.json`: formulas, saturation assessment, $M_s$, two $M_A$ estimators, field statistics, plasma beta, and energies.
+- `trk/*.trk`: AthenaK tracked particle trajectory records when particles are enabled.
+- `pvtk/*.part.vtk`: AthenaK particle-position VTK snapshots when particles are enabled.
+- `analysis/energy_history.png`: kinetic, magnetic-fluctuation, turbulent, and total magnetic energy history.
+- `analysis/diagnostics.csv` and `analysis/diagnostics.json`: snapshot diagnostics including reversal contrast and current-sheet proxy.
+- `analysis/selected_snapshot/*.h5`: selected `.athdf` converted to contiguous cubes.
+- `analysis/bfield_slices/*.png`: three orthogonal magnetic slices from the selected snapshot.
 
-The primary definitions are
-
-\[
-M_s = \frac{v_{rms,\rho}}{c_s}, \qquad
-M_A = \frac{v_{rms,\rho}}{|\langle B\rangle|/\sqrt{\langle\rho\rangle}}, \qquad
-M_{A,B}=\frac{\delta B_{rms}}{|\langle B\rangle|}.
-\]
-
-Only tune $M_A$ from a run that the saturation diagnostic accepts. A useful next iteration is
-
-\[
-B_{0,new} \approx B_{0,old}\frac{M_{A,measured}}{M_{A,target}},
-\]
-
-followed by a fresh run because magnetic tension changes the saturated velocity. Repeat at an affordable resolution before committing to $512^3$.
-
-## Production scale
-
-For $512^3$, plan on at least 64 GiB, preferably 128 GiB, distributed across MPI ranks. One uncompressed single-precision primitive snapshot is roughly 3.5-4 GiB, so output cadence must be chosen with storage limits in mind. The streaming analyzer reads one MeshBlock at a time for global diagnostics and only the intersecting blocks for a 2D slice.
+AthenaK's current particle pusher in the remote checkout is `drift`, so these particles are an internal output/plumbing sanity check rather than a full Lorentz-force transport calculation.

@@ -3,26 +3,44 @@
 # The dependency environment must provide OpenMPI and MPI-enabled FFTW/HDF5.
 # 256^3 with meshblock=32 -> 512 MeshBlocks; 16 ranks -> 32 blocks/rank.
 #
-# sound_speed=0.75 targets M_s around 1.3 while guide_field=1.07 targets M_A around 0.9.
+# sound_speed=0.75 targets M_s around 1.3 while guide_field=1.07 gives M_A around 0.9.
 
 [paths]
 athena_source = "/home/user0001/apps/athena-main"
 build_dir = "build/athena"
+# External recursive AthenaK checkout pinned to [athenak].revision. The pipeline
+# copies it before installing the custom problem generator; this checkout is not modified.
+athenak_source = "/home/user0001/apps/athenak"
+athenak_build_dir = "build/athenak"
 output_root = "outputs"
 
 [execution]
+solver = "athena++"
 backend = "linux"
 dependency_prefix = "/home/user0001/.conda/envs/athena-build"
 threads = 1
 mpi_ranks = 16
 mpi_compiler = "mpicxx"
 mpi_launcher = "mpirun"
+julia_command = "julia"
+python_command = "python3"
 
 [build]
 eos = "isothermal"
 openmp = false
 mpi = true
 single_precision = false
+
+[athenak]
+revision = "5f1993109bcb2e5d588ba41b4efc897408e9959a"
+device = "cpu"
+# Required for device="cuda" (examples: AMPERE80, ADA89, HOPPER90). This is
+# machine-local and must match the installed NVIDIA GPU and Kokkos support.
+kokkos_arch = ""
+integrator = "rk2"
+reconstruction = "plm"
+# Athena++'s exclusive forcing bounds below are translated to AthenaK's
+# inclusive bounds (nlow+1, nhigh-1).
 
 [simulation]
 run_name = "mhd_256_ms_gt1"
@@ -39,7 +57,11 @@ sound_speed = 0.75
 pressure0 = 0.6
 # Iteration 2 of the mhd_256_ma09 lineage kept B0=1.07 (M_A ~0.93); unchanged here.
 guide_field = [1.07, 0.0, 0.0]
-target_ma = 0.9
+
+[selection]
+# Choose exactly one matching mode: "ms" uses sonic_mach; "ma" uses delta-B_rms/|<B>|.
+metric = "ms"
+target = 1.3
 
 [forcing]
 mode = 2

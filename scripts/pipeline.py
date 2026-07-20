@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, run, and analyze the local Athena++ MHD turbulence case."""
+"""Build, run, convert, and analyze Athena++/AthenaK MHD turbulence cases."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tomllib
@@ -20,7 +21,17 @@ from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PGEN_SOURCE = ROOT / "solver" / "mhd_turbulence.cpp"
+ATHENAPP_PGEN_SOURCE = ROOT / "solver" / "mhd_turbulence.cpp"
+ATHENAK_PGEN_SOURCE = ROOT / "solver" / "athenak_mhd_turbulence.cpp"
+ATHENAK_REVISION = "5f1993109bcb2e5d588ba41b4efc897408e9959a"
+ATHENAK_FORCING_OVERLAY_SHA256 = (
+    "769352f948ec26934db7df8ea4933d99a25fe8bb459909a523aa8923d750ba8f"
+)
+SOLVERS = ("athena++", "athenak")
+
+
+class RunTimeoutError(RuntimeError):
+    """Raised after a timed-out simulation process group has been reaped."""
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -28,9 +39,24 @@ def load_config(path: str | Path) -> dict[str, Any]:
     with config_path.open("rb") as stream:
         cfg = tomllib.load(stream)
     cfg["_config_path"] = str(config_path)
-    for section in ("paths", "execution", "build", "simulation", "forcing", "output"):
+    for section in ("paths", "execution", "build", "simulation", "forcing", "output", "selection"):
         if section not in cfg:
             raise ValueError(f"Missing [{section}] in {config_path}")
+    cfg["execution"].setdefault("solver", "athena++")
+    return cfg
+
+
+def solver_name(cfg: dict[str, Any]) -> str:
+    solver = str(cfg["execution"].get("solver", "athena++")).lower()
+    if solver not in SOLVERS:
+        raise ValueError(f"execution.solver must be one of {SOLVERS}, got {solver!r}")
+    return solver
+
+
+def set_solver(cfg: dict[str, Any], override: str | None) -> dict[str, Any]:
+    if override is not None:
+        cfg["execution"]["solver"] = override
+    solver_name(cfg)
     return cfg
 
 
@@ -67,6 +93,7 @@ def run_backend(
     cfg: dict[str, Any],
     *,
     log_path: Path | None = None,
+    timeout_seconds: float | None = None,
 ) -> None:
     execution = cfg["execution"]
     prefix = execution.get("dependency_prefix", "")
@@ -78,7 +105,9 @@ def run_backend(
     }
     if prefix:
         env_updates["PATH"] = f"{prefix}/bin:$PATH"
-        env_updates["LD_LIBRARY_PATH"] = f"{prefix}/lib:${{LD_LIBRARY_PATH:-}}"
+        env_updates["LD_LIBRARY_PATH"] = (
+            f"{prefix}/lib64:{prefix}/lib:${{LD_LIBRARY_PATH:-}}"
+        )
 
     print(f"[pipeline] cwd: {cwd}")
     print("[pipeline] command:", " ".join(shlex.quote(item) for item in command))
@@ -93,8 +122,7 @@ def run_backend(
                 f"cd {shlex.quote(backend_path(cwd, cfg))}; exec "
                 + " ".join(shlex.quote(item) for item in command)
             )
-            subprocess.run(
-                [
+            actual_command = [
                     "wsl.exe",
                     "-d",
                     execution["wsl_distro"],
@@ -102,26 +130,60 @@ def run_backend(
                     "bash",
                     "-lc",
                     shell_command,
-                ],
-                check=True,
-                stdout=output,
-                stderr=subprocess.STDOUT if output else None,
-            )
+                ]
+            actual_cwd = None
+            actual_env = None
         else:
             env = os.environ.copy()
             env.update(env_updates)
             if prefix:
                 env["PATH"] = f"{prefix}/bin:{os.environ.get('PATH', '')}"
                 old_ld = os.environ.get("LD_LIBRARY_PATH", "")
-                env["LD_LIBRARY_PATH"] = f"{prefix}/lib:{old_ld}"
-            subprocess.run(command, check=True, cwd=cwd, env=env, stdout=output,
-                           stderr=subprocess.STDOUT if output else None)
+                env["LD_LIBRARY_PATH"] = f"{prefix}/lib64:{prefix}/lib:{old_ld}"
+            actual_command = command
+            actual_cwd = cwd
+            actual_env = env
+
+        if timeout_seconds is None:
+            subprocess.run(actual_command, check=True, cwd=actual_cwd, env=actual_env,
+                           stdout=output, stderr=subprocess.STDOUT if output else None)
+        else:
+            process = subprocess.Popen(
+                actual_command,
+                cwd=actual_cwd,
+                env=actual_env,
+                stdout=output,
+                stderr=subprocess.STDOUT if output else None,
+                start_new_session=(os.name != "nt"),
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
+            )
+            try:
+                return_code = process.wait(timeout=float(timeout_seconds))
+            except subprocess.TimeoutExpired as exc:
+                if os.name == "nt":
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=30.0)
+                except subprocess.TimeoutExpired:
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                raise RunTimeoutError(
+                    f"Simulation exceeded {float(timeout_seconds):g} seconds; its process "
+                    "group was terminated and partial output was preserved"
+                ) from exc
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, actual_command)
     finally:
         if output:
             output.close()
 
 
-def prepare_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
+def prepare_athenapp_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
     source = project_path(cfg["paths"]["athena_source"])
     build_dir = project_path(cfg["paths"]["build_dir"])
     if not (source / "configure.py").is_file():
@@ -136,7 +198,7 @@ def prepare_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
             ignore=shutil.ignore_patterns(".git", ".github", "doc", "tst", "vis", "__pycache__"),
         )
     target_pgen = build_dir / "src" / "pgen" / "mhd_turbulence.cpp"
-    shutil.copy2(PGEN_SOURCE, target_pgen)
+    shutil.copy2(ATHENAPP_PGEN_SOURCE, target_pgen)
     # Athena++ v24.0-145 detects GCC's __FLT16_MAX__ but then aliases the
     # ARM-only __fp16 spelling. On x86 GCC the supported spelling is _Float16.
     # Apply this narrowly to the disposable build copy, never to athena/.
@@ -159,8 +221,8 @@ def prepare_build_tree(cfg: dict[str, Any], clean: bool) -> Path:
     return build_dir
 
 
-def build(cfg: dict[str, Any], clean: bool = False) -> Path:
-    build_dir = prepare_build_tree(cfg, clean)
+def build_athenapp(cfg: dict[str, Any], clean: bool = False) -> Path:
+    build_dir = prepare_athenapp_build_tree(cfg, clean)
     build_cfg = cfg["build"]
     execution = cfg["execution"]
     prefix = execution.get("dependency_prefix", "")
@@ -196,9 +258,164 @@ def build(cfg: dict[str, Any], clean: bool = False) -> Path:
     return binary
 
 
+def athenak_tree_paths(cfg: dict[str, Any]) -> tuple[Path, Path, Path]:
+    root = project_path(cfg["paths"]["athenak_build_dir"])
+    return root, root / "source", root / "build"
+
+
+def _git_revision(source: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"AthenaK source is not a Git checkout: {source}") from exc
+    return result.stdout.strip()
+
+
+def _validate_recursive_checkout(source: Path) -> None:
+    for arguments in (("diff", "--quiet"), ("diff", "--cached", "--quiet")):
+        result = subprocess.run(["git", "-C", str(source), *arguments], check=False)
+        if result.returncode != 0:
+            raise ValueError(f"AthenaK source has tracked local changes: {source}")
+    try:
+        gitlink = subprocess.run(
+            ["git", "-C", str(source), "ls-tree", "HEAD", "kokkos"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()[2]
+    except (subprocess.CalledProcessError, IndexError) as exc:
+        raise ValueError("AthenaK checkout does not contain the pinned Kokkos submodule") from exc
+    actual = _git_revision(source / "kokkos")
+    if actual != gitlink:
+        raise ValueError(f"AthenaK Kokkos submodule is at {actual}; expected {gitlink}")
+
+
+def _load_forcing_overlay() -> Any:
+    import importlib.util
+
+    path = ROOT / "scripts" / "apply_athenak_forcing_overlay.py"
+    spec = importlib.util.spec_from_file_location("apply_athenak_forcing_overlay", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load AthenaK forcing overlay at {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def prepare_athenak_build_tree(cfg: dict[str, Any], clean: bool) -> tuple[Path, Path]:
+    external_source = project_path(cfg["paths"]["athenak_source"])
+    expected_revision = str(cfg["athenak"].get("revision", ATHENAK_REVISION)).strip()
+    if not (external_source / "CMakeLists.txt").is_file():
+        raise FileNotFoundError(f"AthenaK source not found at {external_source}")
+    if not (external_source / "kokkos" / "CMakeLists.txt").is_file():
+        raise FileNotFoundError("AthenaK Kokkos submodule is missing; update submodules recursively")
+    if expected_revision:
+        actual_revision = _git_revision(external_source)
+        if actual_revision != expected_revision:
+            raise ValueError(
+                f"AthenaK source revision is {actual_revision}; expected {expected_revision}"
+            )
+        _validate_recursive_checkout(external_source)
+
+    root, source_copy, cmake_build = athenak_tree_paths(cfg)
+    if clean and root.exists():
+        shutil.rmtree(root)
+    if not source_copy.exists():
+        root.mkdir(parents=True, exist_ok=True)
+        print(f"[pipeline] copying AthenaK source to {source_copy}")
+        shutil.copytree(
+            external_source,
+            source_copy,
+            ignore=shutil.ignore_patterns(".git", ".github", "build", "__pycache__"),
+        )
+        nvcc_wrapper = source_copy / "kokkos" / "bin" / "nvcc_wrapper"
+        if nvcc_wrapper.exists():
+            nvcc_wrapper.write_bytes(nvcc_wrapper.read_bytes().replace(b"\r\n", b"\n"))
+            nvcc_wrapper.chmod(nvcc_wrapper.stat().st_mode | 0o755)
+    target_pgen = source_copy / "src" / "pgen" / "mhd_turbulence.cpp"
+    shutil.copy2(ATHENAK_PGEN_SOURCE, target_pgen)
+    overlay = _load_forcing_overlay()
+    overlay_record = root / "forcing_overlay.json"
+    if not overlay_record.is_file():
+        overlay_hash = overlay.apply_overlay(source_copy)
+        overlay_record.write_text(json.dumps({
+            "upstream_commit": overlay.UPSTREAM_COMMIT,
+            "overlay_sha256": overlay_hash,
+        }, indent=2), encoding="utf-8")
+    else:
+        overlay_hash = json.loads(overlay_record.read_text(encoding="utf-8"))["overlay_sha256"]
+    if overlay_hash != ATHENAK_FORCING_OVERLAY_SHA256:
+        raise RuntimeError(
+            f"AthenaK forcing overlay SHA256 is {overlay_hash}; expected "
+            f"{ATHENAK_FORCING_OVERLAY_SHA256}"
+        )
+    print(f"[pipeline] AthenaK forcing overlay {overlay.UPSTREAM_COMMIT} SHA256={overlay_hash}")
+    cmake_build.mkdir(parents=True, exist_ok=True)
+    return source_copy, cmake_build
+
+
+def athenak_cmake_command(cfg: dict[str, Any], source: Path, cmake_build: Path) -> list[str]:
+    execution = cfg["execution"]
+    build_cfg = cfg["build"]
+    athenak_cfg = cfg["athenak"]
+    device = str(athenak_cfg.get("device", "cpu")).lower()
+    command = [
+        "cmake",
+        "-S", backend_path(source, cfg),
+        "-B", backend_path(cmake_build, cfg),
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DPROBLEM=mhd_turbulence",
+        f"-DAthena_SINGLE_PRECISION={'ON' if build_cfg.get('single_precision', False) else 'OFF'}",
+        f"-DAthena_ENABLE_MPI={'ON' if build_cfg.get('mpi', False) else 'OFF'}",
+        f"-DAthena_ENABLE_OPENMP={'ON' if build_cfg.get('openmp', False) else 'OFF'}",
+    ]
+    if build_cfg.get("mpi", False):
+        command.append(f"-DMPI_CXX_COMPILER={execution.get('mpi_compiler', 'mpicxx')}")
+    if device == "cpu":
+        command.append("-DKokkos_ARCH_NATIVE=ON")
+    else:
+        arch = str(athenak_cfg["kokkos_arch"])
+        wrapper = source / "kokkos" / "bin" / "nvcc_wrapper"
+        command.extend([
+            "-DKokkos_ENABLE_CUDA=ON",
+            f"-DKokkos_ARCH_{arch}=ON",
+            f"-DCMAKE_CXX_COMPILER={backend_path(wrapper, cfg)}",
+        ])
+    return command
+
+
+def build_athenak(cfg: dict[str, Any], clean: bool = False) -> Path:
+    validate_simulation_config(cfg)
+    source, cmake_build = prepare_athenak_build_tree(cfg, clean)
+    run_backend(athenak_cmake_command(cfg, source, cmake_build), ROOT, cfg)
+    jobs = max(1, int(cfg["execution"].get("threads", 1)))
+    run_backend(
+        ["cmake", "--build", backend_path(cmake_build, cfg), "--parallel", str(jobs)],
+        ROOT,
+        cfg,
+    )
+    candidates = (cmake_build / "src" / "athena", cmake_build / "athena")
+    binary = next((item for item in candidates if item.exists()), candidates[0])
+    if not binary.exists():
+        raise RuntimeError(f"AthenaK build completed without producing {binary}")
+    print(f"[pipeline] built {binary}")
+    return binary
+
+
+def build(cfg: dict[str, Any], clean: bool = False) -> Path:
+    return build_athenak(cfg, clean) if solver_name(cfg) == "athenak" else build_athenapp(cfg, clean)
+
+
 def validate_simulation_config(cfg: dict[str, Any]) -> None:
+    solver = solver_name(cfg)
     sim = cfg["simulation"]
     forcing = cfg["forcing"]
+    selection = cfg["selection"]
     n = int(sim["resolution"])
     mb = int(sim["meshblock"])
     if n <= 0 or mb <= 0 or n % mb:
@@ -209,10 +426,43 @@ def validate_simulation_config(cfg: dict[str, Any]) -> None:
         raise ValueError("simulation.guide_field must contain three components")
     if not 0.0 <= float(forcing["solenoidal_fraction"]) <= 1.0:
         raise ValueError("forcing.solenoidal_fraction must be in [0, 1]")
+    if int(forcing["nlow"]) + 1 > int(forcing["nhigh"]) - 1:
+        raise ValueError("forcing exclusive bounds contain no AthenaK integer shell")
+    if float(forcing["correlation_time"]) <= 0.0 or float(forcing["drive_interval"]) <= 0.0:
+        raise ValueError("forcing correlation_time and drive_interval must be positive")
+    if int(sim.get("nlim", -1)) == 0:
+        raise ValueError("simulation.nlim must be positive or -1")
+    if str(selection.get("metric", "")).lower() not in ("ms", "ma"):
+        raise ValueError("selection.metric must be 'ms' or 'ma'")
+    target = float(selection["target"])
+    if not math.isfinite(target) or target <= 0.0:
+        raise ValueError("selection.target must be a positive finite number")
+    if solver == "athenak":
+        if "athenak" not in cfg:
+            raise ValueError("Missing [athenak] for the AthenaK solver")
+        for key in ("athenak_source", "athenak_build_dir"):
+            if key not in cfg["paths"]:
+                raise ValueError(f"paths.{key} is required for the AthenaK solver")
+        ak = cfg["athenak"]
+        revision = str(ak.get("revision", "")).strip()
+        if revision and revision != ATHENAK_REVISION:
+            raise ValueError(f"athenak.revision must be empty or pinned to {ATHENAK_REVISION}")
+        if str(ak.get("device", "cpu")).lower() not in ("cpu", "cuda"):
+            raise ValueError("athenak.device must be 'cpu' or 'cuda'")
+        if str(ak.get("device", "cpu")).lower() == "cuda" and not str(ak.get("kokkos_arch", "")).strip():
+            raise ValueError("athenak.kokkos_arch is required for CUDA builds")
+        if str(ak.get("integrator", "rk2")) != "rk2":
+            raise ValueError("This workflow requires athenak.integrator = 'rk2'")
+        if str(ak.get("reconstruction", "plm")) != "plm":
+            raise ValueError("This workflow requires athenak.reconstruction = 'plm'")
+        if "nlow" in ak or "nhigh" in ak:
+            raise ValueError(
+                "Remove duplicate athenak.nlow/nhigh; Athena++ forcing bounds are translated"
+            )
 
 
-def render_athinput(cfg: dict[str, Any], run_name: str | None = None,
-                    guide_field: Iterable[float] | None = None) -> str:
+def render_athenapp_input(cfg: dict[str, Any], run_name: str | None = None,
+                          guide_field: Iterable[float] | None = None) -> str:
     validate_simulation_config(cfg)
     sim = cfg["simulation"]
     forcing = cfg["forcing"]
@@ -249,7 +499,7 @@ dt = {float(output['restart_interval']):.16g}
 
 <time>
 cfl_number = {float(sim['cfl']):.16g}
-nlim = -1
+nlim = {int(sim.get('nlim', -1))}
 tlim = {float(sim['tlim']):.16g}
 integrator = {sim.get('integrator', 'vl2')}
 xorder = {int(sim.get('reconstruction_order', 2))}
@@ -303,18 +553,119 @@ rseed = {int(forcing['random_seed'])}
 """
 
 
+def effective_run_name(cfg: dict[str, Any], run_name: str | None = None) -> str:
+    if run_name:
+        return run_name
+    base = str(cfg["simulation"]["run_name"])
+    return f"{base}_athenak" if solver_name(cfg) == "athenak" else base
+
+
+def render_athenak_input(cfg: dict[str, Any], run_name: str | None = None,
+                         guide_field: Iterable[float] | None = None) -> str:
+    validate_simulation_config(cfg)
+    sim = cfg["simulation"]
+    forcing = cfg["forcing"]
+    output = cfg["output"]
+    ak = cfg["athenak"]
+    name = effective_run_name(cfg, run_name)
+    n = int(sim["resolution"])
+    mb = int(sim["meshblock"])
+    half = 0.5 * float(sim["box_length"])
+    b1, b2, b3 = tuple(guide_field or sim["guide_field"])
+    return f"""<comment>
+problem = Homogeneous, driven, compressible isothermal MHD turbulence
+
+<job>
+basename = {name}
+
+<mesh>
+nghost = 2
+nx1 = {n}
+x1min = {-half:.16g}
+x1max = {half:.16g}
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = {n}
+x2min = {-half:.16g}
+x2max = {half:.16g}
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = {n}
+x3min = {-half:.16g}
+x3max = {half:.16g}
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = {mb}
+nx2 = {mb}
+nx3 = {mb}
+
+<time>
+evolution = dynamic
+integrator = {ak.get('integrator', 'rk2')}
+cfl_number = {float(sim['cfl']):.16g}
+nlim = {int(sim.get('nlim', -1))}
+tlim = {float(sim['tlim']):.16g}
+ndiag = 10
+
+<mhd>
+eos = isothermal
+reconstruct = {ak.get('reconstruction', 'plm')}
+rsolver = hlld
+iso_sound_speed = {float(sim['sound_speed']):.16g}
+
+<problem>
+rho0 = {float(sim['rho0']):.16g}
+b1 = {float(b1):.16g}
+b2 = {float(b2):.16g}
+b3 = {float(b3):.16g}
+
+<turb_driving>
+type = mhd
+driving_type = 0
+turb_flag = {int(forcing['mode'])}
+dedt = {float(forcing['energy_injection_rate']):.16g}
+tcorr = {float(forcing['correlation_time']):.16g}
+dt_turb_update = {float(forcing['drive_interval']):.16g}
+sol_fraction = {float(forcing['solenoidal_fraction']):.16g}
+random_seed = {int(forcing['random_seed'])}
+expo = {float(forcing['spectrum_exponent']):.16g}
+spect_form = 2
+nlow = {int(forcing['nlow']) + 1}
+nhigh = {int(forcing['nhigh']) - 1}
+
+<output1>
+file_type = hst
+dt = {float(output['history_interval']):.16g}
+
+<output2>
+file_type = bin
+variable = mhd_w_bcc
+id = out2
+single_file_per_rank = false
+dt = {float(output['snapshot_interval']):.16g}
+
+<output3>
+file_type = rst
+dt = {float(output['restart_interval']):.16g}
+"""
+
+
+def render_athinput(cfg: dict[str, Any], run_name: str | None = None,
+                    guide_field: Iterable[float] | None = None) -> str:
+    if solver_name(cfg) == "athenak":
+        return render_athenak_input(cfg, run_name, guide_field)
+    return render_athenapp_input(cfg, run_name, guide_field)
+
+
 def run_directory(cfg: dict[str, Any], run_name: str | None = None) -> Path:
-    name = run_name or str(cfg["simulation"]["run_name"])
+    name = effective_run_name(cfg, run_name)
     return project_path(cfg["paths"]["output_root"]) / name
 
 
-def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
-                   run_name: str | None = None,
-                   guide_field: Iterable[float] | None = None) -> Path:
-    build_dir = project_path(cfg["paths"]["build_dir"])
-    binary = build_dir / "bin" / "athena"
-    if not binary.exists():
-        raise FileNotFoundError("Athena++ binary is missing; run the build command first")
+def _prepare_run_directory(cfg: dict[str, Any], overwrite: bool,
+                           run_name: str | None) -> Path:
     run_dir = run_directory(cfg, run_name)
     if run_dir.exists() and overwrite:
         if run_dir == run_dir.parent or run_dir.name in ("", ".", ".."):
@@ -323,6 +674,54 @@ def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
     if run_dir.exists() and any(run_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {run_dir}; pass --overwrite")
     run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def simulation_timeout(cfg: dict[str, Any]) -> float | None:
+    value = cfg["execution"].get("simulation_timeout")
+    if value is None:
+        return None
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0.0 or timeout > 7200.0:
+        raise ValueError("execution.simulation_timeout must be in (0, 7200] seconds")
+    return timeout
+
+
+def verify_tlim_completion(cfg: dict[str, Any], history_path: Path) -> dict[str, Any]:
+    history = read_history(history_path)
+    times = history.get("time", [])
+    if not times:
+        raise RuntimeError(f"No usable history samples in {history_path}")
+    final_time = float(times[-1])
+    tlim = float(cfg["simulation"]["tlim"])
+    tolerance = 1.0e-5 * max(1.0, abs(tlim))
+    if abs(final_time - tlim) > tolerance:
+        raise RuntimeError(
+            f"Simulation stopped at t={final_time:g}, not configured tlim={tlim:g}; "
+            "it may have reached nlim"
+        )
+    result: dict[str, Any] = {
+        "reason": "tlim",
+        "final_time": final_time,
+        "tlim": tlim,
+    }
+    cycles = history.get("cycle", history.get("ncycle", []))
+    if cycles:
+        result["final_cycle"] = int(cycles[-1])
+        nlim = int(cfg["simulation"].get("nlim", -1))
+        if nlim > 0 and result["final_cycle"] >= nlim:
+            raise RuntimeError(f"Simulation reached nlim={nlim} instead of terminating on tlim")
+    return result
+
+
+def run_athenapp(cfg: dict[str, Any], overwrite: bool = False,
+                 run_name: str | None = None,
+                 guide_field: Iterable[float] | None = None) -> Path:
+    build_dir = project_path(cfg["paths"]["build_dir"])
+    binary = build_dir / "bin" / "athena"
+    if not binary.exists():
+        raise FileNotFoundError("Athena++ binary is missing; run the build command first")
+    run_dir = _prepare_run_directory(cfg, overwrite, run_name)
     input_path = run_dir / "athinput.generated"
     # Athena++'s parameter parser does not strip a Windows carriage return
     # from string values (for example, it reads "periodic\r"). Force LF.
@@ -336,12 +735,121 @@ def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
     if cfg["build"].get("mpi", False) and mpi_ranks > 1:
         command = [cfg["execution"].get("mpi_launcher", "mpirun"), "-np", str(mpi_ranks)] + command
     log_path = run_dir / "run.log"
-    run_backend(command, run_dir, cfg, log_path=log_path)
+    run_backend(
+        command, run_dir, cfg, log_path=log_path,
+        timeout_seconds=simulation_timeout(cfg),
+    )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
     if "FATAL ERROR" in log_text:
         raise RuntimeError(f"Athena++ reported a fatal error; inspect {log_path}")
+    history_files = sorted(run_dir.glob("*.hst"))
+    if not history_files:
+        raise RuntimeError(f"Athena++ produced no history file in {run_dir}")
+    verify_tlim_completion(cfg, history_files[-1])
     print(f"[pipeline] simulation log: {log_path}")
     return run_dir
+
+
+def athenak_binary(cfg: dict[str, Any]) -> Path:
+    _, _, cmake_build = athenak_tree_paths(cfg)
+    candidates = (cmake_build / "src" / "athena", cmake_build / "athena")
+    return next((item for item in candidates if item.exists()), candidates[0])
+
+
+def run_athenak(cfg: dict[str, Any], overwrite: bool = False,
+                run_name: str | None = None,
+                guide_field: Iterable[float] | None = None) -> Path:
+    validate_simulation_config(cfg)
+    binary = athenak_binary(cfg)
+    if not binary.exists():
+        raise FileNotFoundError("AthenaK binary is missing; run the build command first")
+    run_dir = _prepare_run_directory(cfg, overwrite, run_name)
+    input_path = run_dir / "athinput.generated"
+    input_path.write_text(
+        render_athenak_input(cfg, run_name, guide_field), encoding="utf-8", newline="\n"
+    )
+    command = [backend_path(binary, cfg), "-i", "athinput.generated"]
+    mpi_ranks = int(cfg["execution"].get("mpi_ranks", 1))
+    if cfg["build"].get("mpi", False) and mpi_ranks > 1:
+        command = [cfg["execution"].get("mpi_launcher", "mpirun"), "-np", str(mpi_ranks)] + command
+    log_path = run_dir / "run.log"
+    run_backend(
+        command, run_dir, cfg, log_path=log_path,
+        timeout_seconds=simulation_timeout(cfg),
+    )
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if "FATAL ERROR" in log_text:
+        raise RuntimeError(f"AthenaK reported a fatal error; inspect {log_path}")
+    history_path = run_dir / f"{effective_run_name(cfg, run_name)}.mhd.hst"
+    completion = verify_tlim_completion(cfg, history_path)
+    overlay_path = athenak_tree_paths(cfg)[0] / "forcing_overlay.json"
+    overlay_metadata = (
+        json.loads(overlay_path.read_text(encoding="utf-8")) if overlay_path.is_file() else {}
+    )
+    metadata = {
+        "solver": "athenak",
+        "revision": str(cfg["athenak"]["revision"]),
+        "device": str(cfg["athenak"].get("device", "cpu")),
+        "kokkos_arch": str(cfg["athenak"].get("kokkos_arch", "")),
+        "precision": "fp32" if cfg["build"].get("single_precision", False) else "fp64",
+        "forcing_overlay": overlay_metadata,
+        "run_completion": completion,
+        "backend_controls": {
+            "forcing.mode": "turb_flag",
+            "forcing.energy_injection_rate": "dedt",
+            "forcing.correlation_time": "tcorr",
+            "forcing.drive_interval": "dt_turb_update",
+            "forcing.solenoidal_fraction": "sol_fraction",
+            "forcing.random_seed": "random_seed",
+            "forcing.spectrum_exponent": "expo with spect_form=2",
+            "forcing.band": "exclusive [nlow, nhigh] translated to inclusive nlow+1, nhigh-1",
+        },
+    }
+    (run_dir / "solver_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"[pipeline] simulation log: {log_path}")
+    return run_dir
+
+
+def run_simulation(cfg: dict[str, Any], overwrite: bool = False,
+                   run_name: str | None = None,
+                   guide_field: Iterable[float] | None = None) -> Path:
+    if solver_name(cfg) == "athenak":
+        return run_athenak(cfg, overwrite, run_name, guide_field)
+    return run_athenapp(cfg, overwrite, run_name, guide_field)
+
+
+def _load_athenak_converter() -> Any:
+    import importlib.util
+
+    path = ROOT / "scripts" / "athenak_to_athdf.py"
+    spec = importlib.util.spec_from_file_location("athenak_to_athdf", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load AthenaK converter at {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def convert(cfg: dict[str, Any], run_name: str | None = None) -> list[Path]:
+    run_dir = run_directory(cfg, run_name)
+    analysis_dir = run_dir / "analysis"
+    diagnostics_path = analysis_dir / "diagnostics.json"
+    summary: dict[str, Any] | None = None
+    if diagnostics_path.is_file():
+        candidate = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        selection = candidate.get("target_selection")
+        if isinstance(selection, dict) and isinstance(selection.get("snapshot"), dict):
+            summary = candidate
+    if summary is None:
+        analyze(cfg, run_name)
+        summary = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    products = postprocess_selected_snapshot(
+        cfg, run_dir, analysis_dir, summary["target_selection"]
+    )
+    summary["target_selection"]["products"] = products
+    diagnostics_path.write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
+    return [Path(value) for key, value in products.items() if key != "source_snapshot"]
 
 
 def _variable_map(handle: Any) -> dict[str, tuple[str, int]]:
@@ -365,7 +873,7 @@ def _read_block(handle: Any, mapping: dict[str, tuple[str, int]], name: str,
     return handle[dataset][index, block, ...]
 
 
-def snapshot_diagnostics(path: Path, sound_speed: float, target_ma: float) -> dict[str, Any]:
+def snapshot_diagnostics(path: Path, sound_speed: float) -> dict[str, Any]:
     import h5py
     import numpy as np
 
@@ -424,6 +932,7 @@ def snapshot_diagnostics(path: Path, sound_speed: float, target_ma: float) -> di
 
         return {
             "file": path.name,
+            "source_filename": path.name,
             "time": float(handle.attrs["Time"]),
             "cycle": int(handle.attrs["NumCycles"]),
             "mean_density": mean_rho,
@@ -437,14 +946,88 @@ def snapshot_diagnostics(path: Path, sound_speed: float, target_ma: float) -> di
             "alfven_speed_mean_field": alfven_speed,
             "alfvenic_mach_velocity": ma_velocity,
             "alfvenic_mach_magnetic": ma_magnetic,
-            "target_alfvenic_mach": target_ma,
-            "target_ma_fractional_error": (ma_velocity - target_ma) / target_ma,
             "kinetic_energy_density": 0.5 * mean_rho * turbulent_v2,
             "magnetic_energy_density": magnetic_energy,
             "magnetic_fluctuation_energy_density": 0.5 * delta_b_rms**2,
             "mean_gas_pressure": pressure,
             "plasma_beta": pressure / magnetic_energy if magnetic_energy > 0 else math.inf,
         }
+
+
+def athenak_snapshot_diagnostics(path: Path, sound_speed: float) -> dict[str, Any]:
+    """Stream scalar diagnostics directly from one AthenaK shared binary output."""
+    import numpy as np
+
+    converter = _load_athenak_converter()
+    with path.open("rb") as stream:
+        header = converter.read_header(stream)
+        count_blocks = converter.count_blocks(path, header)
+        if tuple(header.variable_names) != converter.SOURCE_NAMES:
+            raise ValueError(
+                f"Expected AthenaK variables {converter.SOURCE_NAMES}, got {header.variable_names}"
+            )
+        count = 0
+        sum_rho = sum_rho2 = sum_rho_v2 = 0.0
+        sum_momentum = np.zeros(3, dtype=np.float64)
+        sum_b = np.zeros(3, dtype=np.float64)
+        sum_b2 = 0.0
+        minimum_density = math.inf
+        all_finite = True
+        for block in converter.iter_blocks(stream, header, count_blocks):
+            values = np.asarray(block.variables, dtype=np.float64)
+            rho = values[0]
+            velocity = values[1:4]
+            magnetic = values[4:7]
+            all_finite = all_finite and bool(np.isfinite(values).all())
+            minimum_density = min(minimum_density, float(np.min(rho)))
+            count += rho.size
+            sum_rho += float(rho.sum())
+            sum_rho2 += float(np.square(rho).sum())
+            speed2 = np.sum(np.square(velocity), axis=0)
+            sum_rho_v2 += float((rho * speed2).sum())
+            for component in range(3):
+                sum_momentum[component] += float((rho * velocity[component]).sum())
+                sum_b[component] += float(magnetic[component].sum())
+            sum_b2 += float(np.sum(np.square(magnetic)))
+
+    mean_rho = sum_rho / count
+    mean_velocity = sum_momentum / sum_rho
+    turbulent_v2 = max(0.0, sum_rho_v2 / sum_rho - float(mean_velocity @ mean_velocity))
+    velocity_rms = math.sqrt(turbulent_v2)
+    mean_b = sum_b / count
+    mean_b_strength = float(np.linalg.norm(mean_b))
+    mean_b2 = sum_b2 / count
+    delta_b_rms = math.sqrt(max(0.0, mean_b2 - mean_b_strength**2))
+    alfven_speed = mean_b_strength / math.sqrt(mean_rho) if mean_rho > 0 else math.nan
+    magnetic_energy = 0.5 * mean_b2
+    pressure = mean_rho * sound_speed**2
+    density_variance = max(0.0, sum_rho2 / count - mean_rho**2)
+    return {
+        "file": path.name,
+        "source_filename": path.name,
+        "time": float(header.time),
+        "cycle": int(header.cycle),
+        "finite_state": all_finite,
+        "minimum_density": minimum_density,
+        "mean_density": mean_rho,
+        "density_std": math.sqrt(density_variance),
+        "mean_velocity": mean_velocity.tolist(),
+        "velocity_rms_density_weighted": velocity_rms,
+        "sonic_mach": velocity_rms / sound_speed,
+        "mean_magnetic_field": mean_b.tolist(),
+        "mean_magnetic_strength": mean_b_strength,
+        "magnetic_fluctuation_rms": delta_b_rms,
+        "alfven_speed_mean_field": alfven_speed,
+        "alfvenic_mach_velocity": velocity_rms / alfven_speed if alfven_speed > 0 else math.inf,
+        "alfvenic_mach_magnetic": (
+            delta_b_rms / mean_b_strength if mean_b_strength > 0 else math.inf
+        ),
+        "kinetic_energy_density": 0.5 * mean_rho * turbulent_v2,
+        "magnetic_energy_density": magnetic_energy,
+        "magnetic_fluctuation_energy_density": 0.5 * delta_b_rms**2,
+        "mean_gas_pressure": pressure,
+        "plasma_beta": pressure / magnetic_energy if magnetic_energy > 0 else math.inf,
+    }
 
 
 def extract_velocity_slice(path: Path, axis_name: str, requested_index: int) -> dict[str, Any]:
@@ -571,6 +1154,12 @@ def saturation_diagnostic(history: dict[str, list[float]], minimum_time: float) 
     import numpy as np
 
     time = np.asarray(history.get("time", []), dtype=float)
+    energy_names = tuple(f"{axis}-{kind}" for kind in ("KE", "ME") for axis in (1, 2, 3))
+    missing = [name for name in energy_names if name not in history]
+    if missing:
+        return {"saturated": None, "reason": f"missing history columns: {', '.join(missing)}"}
+    if any(len(history[name]) != time.size for name in energy_names):
+        return {"saturated": None, "reason": "history energy columns have inconsistent lengths"}
     kinetic = sum((np.asarray(history.get(f"{i}-KE", []), dtype=float) for i in (1, 2, 3)),
                   start=np.zeros_like(time))
     magnetic = sum((np.asarray(history.get(f"{i}-ME", []), dtype=float) for i in (1, 2, 3)),
@@ -594,8 +1183,110 @@ def saturation_diagnostic(history: dict[str, list[float]], minimum_time: float) 
     return {
         "saturated": relative_change < 0.10,
         "criterion": "<10% fitted turbulent-energy change over the final 25% of samples",
+        "window_start_time": float(x[0]),
+        "window_end_time": float(x[-1]),
+        "window_sample_count": int(x.size),
         "relative_change_final_quarter": relative_change,
         "fitted_slope": slope,
+    }
+
+
+def select_target_snapshot(
+    diagnostics: list[dict[str, Any]],
+    saturation: dict[str, Any],
+    selection_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    if saturation.get("saturated") is not True:
+        reason = saturation.get("reason", "energy stationarity criterion was not met")
+        raise RuntimeError(f"Cannot select a target snapshot: saturation is unconfirmed ({reason})")
+
+    metric = str(selection_cfg.get("metric", "")).lower()
+    diagnostic_key = {"ms": "sonic_mach", "ma": "alfvenic_mach_magnetic"}.get(metric)
+    if diagnostic_key is None:
+        raise ValueError("selection.metric must be 'ms' or 'ma'")
+    target = float(selection_cfg["target"])
+    if not math.isfinite(target) or target <= 0.0:
+        raise ValueError("selection.target must be a positive finite number")
+
+    start = float(saturation["window_start_time"])
+    end = float(saturation["window_end_time"])
+    candidates = [item for item in diagnostics if start <= float(item["time"]) <= end]
+    if not candidates:
+        raise RuntimeError(
+            f"No Athena snapshot falls inside the accepted saturation window [{start:g}, {end:g}]"
+        )
+    selected = min(
+        candidates,
+        key=lambda item: (abs(float(item[diagnostic_key]) - target), -float(item["time"])),
+    )
+    measured = float(selected[diagnostic_key])
+    return {
+        "metric": metric,
+        "diagnostic": diagnostic_key,
+        "target": target,
+        "measured": measured,
+        "absolute_error": abs(measured - target),
+        "fractional_error": (measured - target) / target,
+        "eligible_snapshot_count": len(candidates),
+        "window_start_time": start,
+        "window_end_time": end,
+        "snapshot": selected,
+    }
+
+
+def postprocess_selected_snapshot(
+    cfg: dict[str, Any], run_dir: Path, analysis_dir: Path, selection: dict[str, Any]
+) -> dict[str, str]:
+    source_snapshot = run_dir / str(selection["snapshot"]["file"])
+    converted_dir = analysis_dir / "selected_snapshot"
+    bfield_dir = analysis_dir / "bfield_slices"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+
+    if solver_name(cfg) == "athenak":
+        converter = _load_athenak_converter()
+        athdf_snapshot = converted_dir / converter.output_name(
+            effective_run_name(cfg), source_snapshot
+        )
+        if (not athdf_snapshot.is_file() or
+                athdf_snapshot.stat().st_mtime_ns < source_snapshot.stat().st_mtime_ns):
+            print(
+                f"[pipeline] materializing selected {source_snapshot.name} -> "
+                f"{athdf_snapshot.name}"
+            )
+            converter.convert_file(source_snapshot, athdf_snapshot)
+    else:
+        athdf_snapshot = source_snapshot
+    converted_path = converted_dir / f"{athdf_snapshot.stem}.h5"
+
+    julia_script = ROOT / "scripts" / "ath2h5.jl"
+    bfield_script = ROOT / "scripts" / "make_bfield_slices.py"
+    run_backend(
+        [
+            str(cfg["execution"].get("julia_command", "julia")),
+            f"--project={backend_path(ROOT, cfg)}",
+            backend_path(julia_script, cfg),
+            "--input", backend_path(athdf_snapshot, cfg),
+            "--output", backend_path(converted_path, cfg),
+        ],
+        run_dir,
+        cfg,
+    )
+    run_backend(
+        [
+            str(cfg["execution"].get("python_command", "python3")),
+            backend_path(bfield_script, cfg),
+            "--input", backend_path(converted_path, cfg),
+            "--output-dir", backend_path(bfield_dir, cfg),
+            "--quiver-stride", str(int(cfg["output"].get("quiver_stride", 8))),
+        ],
+        run_dir,
+        cfg,
+    )
+    return {
+        "source_snapshot": str(source_snapshot),
+        "selected_athdf": str(athdf_snapshot),
+        "converted_snapshot": str(converted_path),
+        "bfield_slice_directory": str(bfield_dir),
     }
 
 
@@ -626,7 +1317,7 @@ def plot_energy_history(history_path: Path, output_path: Path,
         ax.plot(time, history["tot-E"], label="total", linewidth=1.2, linestyle="--")
     ax.set_xlabel("time")
     ax.set_ylabel("volume-averaged energy density")
-    ax.set_title("Athena++ energy history")
+    ax.set_title("Athena energy history")
     ax.grid(alpha=0.25)
     ax.legend()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -635,33 +1326,36 @@ def plot_energy_history(history_path: Path, output_path: Path,
     return saturation_diagnostic(history, minimum_saturation_time)
 
 
-def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+def analyze_common(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     run_dir = run_directory(cfg, run_name)
-    snapshots = sorted(run_dir.glob("*.athdf"))
-    history_files = sorted(run_dir.glob("*.hst"))
+    if solver_name(cfg) == "athenak":
+        name = effective_run_name(cfg, run_name)
+        snapshots = sorted((run_dir / "bin").glob(f"{name}.out2.*.bin"))
+        history_files = [run_dir / f"{effective_run_name(cfg, run_name)}.mhd.hst"]
+        history_files = [path for path in history_files if path.is_file()]
+        diagnostic_reader = athenak_snapshot_diagnostics
+    else:
+        snapshots = sorted(run_dir.glob("*.athdf"))
+        history_files = sorted(run_dir.glob("*.hst"))
+        diagnostic_reader = snapshot_diagnostics
     if not snapshots:
-        raise FileNotFoundError(f"No .athdf snapshots found in {run_dir}")
+        raise FileNotFoundError(f"No raw solver snapshots found in {run_dir}")
     if not history_files:
         raise FileNotFoundError(f"No .hst history file found in {run_dir}")
     analysis_dir = run_dir / "analysis"
-    slice_dir = analysis_dir / "velocity_slices"
-    slice_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
     sim = cfg["simulation"]
     output_cfg = cfg["output"]
     sound_speed = float(sim["sound_speed"])
-    target_ma = float(sim["target_ma"])
 
     diagnostics: list[dict[str, Any]] = []
     for snapshot in snapshots:
         print(f"[pipeline] analyzing {snapshot.name}")
-        diagnostics.append(snapshot_diagnostics(snapshot, sound_speed, target_ma))
-        plot_velocity_slice(
-            snapshot,
-            slice_dir / f"{snapshot.stem}.png",
-            str(output_cfg.get("slice_axis", "x3")),
-            int(output_cfg.get("slice_index", -1)),
-            int(output_cfg.get("quiver_stride", 8)),
-        )
+        item = diagnostic_reader(snapshot, sound_speed)
+        source = str(snapshot.relative_to(run_dir)).replace("\\", "/")
+        item["file"] = source
+        item["source_filename"] = snapshot.name
+        diagnostics.append(item)
 
     scalar_keys = [key for key, value in diagnostics[0].items()
                    if not isinstance(value, (list, dict))]
@@ -675,9 +1369,16 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
     saturation = plot_energy_history(
         history_files[-1], analysis_dir / "energy_history.png", minimum_saturation_time
     )
+    selection: dict[str, Any] | None = None
+    selection_error: str | None = None
+    try:
+        selection = select_target_snapshot(diagnostics, saturation, cfg["selection"])
+    except (RuntimeError, ValueError) as exc:
+        selection_error = str(exc)
     summary = {
         "run_directory": str(run_dir),
         "configuration": str(cfg["_config_path"]),
+        "solver": solver_metadata(cfg, run_dir),
         "definitions": {
             "sonic_mach": "density-weighted turbulent v_rms / isothermal sound speed",
             "alfvenic_mach_velocity": "density-weighted turbulent v_rms / (|<B>|/sqrt(<rho>))",
@@ -685,33 +1386,78 @@ def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
             "athena_units": "magnetic permeability is unity, so magnetic energy density is B^2/2",
         },
         "saturation_heuristic": saturation,
+        "target_selection": selection if selection is not None else {
+            "status": "failed",
+            "error": selection_error,
+        },
         "final_snapshot": diagnostics[-1],
         "snapshots": diagnostics,
     }
-    (analysis_dir / "diagnostics.json").write_text(
+    diagnostics_path = analysis_dir / "diagnostics.json"
+    diagnostics_path.write_text(
+        json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    if selection is None:
+        raise RuntimeError(selection_error or "Target snapshot selection failed")
+
+    products = postprocess_selected_snapshot(cfg, run_dir, analysis_dir, selection)
+    summary["target_selection"]["products"] = products
+    diagnostics_path.write_text(
         json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8"
     )
     print(f"[pipeline] analysis written to {analysis_dir}")
     return analysis_dir
 
 
+def analyze_athenapp(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+    return analyze_common(cfg, run_name)
+
+
+def analyze_athenak(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+    return analyze_common(cfg, run_name)
+
+
+def analyze(cfg: dict[str, Any], run_name: str | None = None) -> Path:
+    if solver_name(cfg) == "athenak":
+        return analyze_athenak(cfg, run_name)
+    return analyze_athenapp(cfg, run_name)
+
+
+def solver_metadata(cfg: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    solver = solver_name(cfg)
+    if solver == "athenak":
+        path = run_dir / "solver_metadata.json"
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "solver": solver,
+            "revision": str(cfg["athenak"]["revision"]),
+            "device": str(cfg["athenak"].get("device", "cpu")),
+            "kokkos_arch": str(cfg["athenak"].get("kokkos_arch", "")),
+        }
+    return {"solver": solver, "revision": "not recorded", "device": "cpu"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("build", "run", "analyze", "all", "input"))
+    parser.add_argument("command", choices=("build", "run", "convert", "analyze", "all", "input"))
     parser.add_argument("--config", default=str(ROOT / "configs" / "local.toml"))
+    parser.add_argument("--solver", choices=SOLVERS, help="override execution.solver")
     parser.add_argument("--clean", action="store_true", help="recreate the disposable Athena build tree")
     parser.add_argument("--overwrite", action="store_true", help="replace the selected run directory")
     parser.add_argument("--run-name", help="override simulation.run_name")
     args = parser.parse_args()
 
     try:
-        cfg = load_config(args.config)
+        cfg = set_solver(load_config(args.config), args.solver)
         if args.command == "input":
             sys.stdout.write(render_athinput(cfg, args.run_name))
         elif args.command == "build":
             build(cfg, clean=args.clean)
         elif args.command == "run":
             run_simulation(cfg, overwrite=args.overwrite, run_name=args.run_name)
+        elif args.command == "convert":
+            convert(cfg, run_name=args.run_name)
         elif args.command == "analyze":
             analyze(cfg, run_name=args.run_name)
         elif args.command == "all":

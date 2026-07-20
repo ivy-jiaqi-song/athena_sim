@@ -1,6 +1,10 @@
 # Per-machine configuration. Start from configs/example.toml.
 configs/*.toml
 !configs/example.toml
+!configs/athenak-gpu-smoke.toml
+!configs/athenak-gpu-ma08-tiny.toml
+!configs/athenak-gpu-ma08.toml
+!configs/athenak-gpu-ma08-preflight-fp32.toml
 
 # Disposable Athena++ build and simulation products.
 build/
@@ -11,6 +15,9 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Resolve Julia artifacts for the platform running the workflow.
+Manifest.toml
 
 # Editor and operating-system files.
 .idea/

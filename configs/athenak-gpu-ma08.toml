@@ -1,0 +1,68 @@
+[paths]
+athena_source = "unused"
+build_dir = "build/unused"
+athenak_source = "/home/user0001/apps/athenak-main"
+athenak_build_dir = "build/athenak-cuda-ma08"
+output_root = "/home/user0001/MHDFlows_replicate/outputs/athenak_cuda_ma08"
+
+[execution]
+solver = "athenak"
+backend = "linux"
+dependency_prefix = "/usr/local/cuda-12.8"
+threads = 16
+mpi_ranks = 1
+mpi_compiler = "mpicxx"
+mpi_launcher = "mpirun"
+julia_command = "julia"
+python_command = "/home/user0001/.conda/envs/athena-build/bin/python"
+simulation_timeout = 6600
+
+[build]
+eos = "isothermal"
+openmp = false
+mpi = false
+single_precision = true
+
+[athenak]
+# The remote AthenaK source was provided as a zip archive, not a Git checkout.
+revision = ""
+device = "cuda"
+kokkos_arch = "BLACKWELL120"
+integrator = "rk2"
+reconstruction = "plm"
+
+[simulation]
+run_name = "ma08_cs1_athenak_cuda"
+resolution = 256
+meshblock = 32
+box_length = 1.0
+tlim = 2.0
+nlim = 20000
+cfl = 0.30
+rho0 = 1.0
+sound_speed = 1.0
+pressure0 = 1.0
+guide_field = [1.227003, 0.0, 0.0]
+
+[selection]
+metric = "ma"
+target = 0.8
+
+[forcing]
+mode = 2
+energy_injection_rate = 1.0
+nlow = 1
+nhigh = 4
+spectrum_exponent = 2.0
+correlation_time = 0.10
+drive_interval = 0.02
+solenoidal_fraction = 1.0
+random_seed = 12345
+
+[output]
+history_interval = 0.05
+snapshot_interval = 0.25
+restart_interval = 1.0
+slice_axis = "x3"
+slice_index = -1
+quiver_stride = 8

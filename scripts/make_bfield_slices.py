@@ -15,9 +15,9 @@ import matplotlib.pyplot as plt
 
 
 SLICES = {
-    "b2b3": {"axis": 0, "axes": ("x2", "x3"), "comps": ("j_mag_field", "k_mag_field")},
-    "b1b3": {"axis": 1, "axes": ("x1", "x3"), "comps": ("i_mag_field", "k_mag_field")},
-    "b1b2": {"axis": 2, "axes": ("x1", "x2"), "comps": ("i_mag_field", "j_mag_field")},
+    "b2b3": {"axis": 0, "axes": ("x2", "x3"), "comps": ("j_mag_field", "i_mag_field")},
+    "b1b3": {"axis": 1, "axes": ("x1", "x3"), "comps": ("k_mag_field", "i_mag_field")},
+    "b1b2": {"axis": 2, "axes": ("x1", "x2"), "comps": ("k_mag_field", "j_mag_field")},
 }
 
 
@@ -35,6 +35,12 @@ def read_snapshot(path: Path) -> dict:
             "domain_bounds must contain [x1min,x1max,x2min,x2max,x3min,x3max]"
         )
     return fields
+
+
+def display_quiver_vectors(u: np.ndarray, v: np.ndarray, length: float) -> tuple[np.ndarray, np.ndarray]:
+    norm = np.sqrt(np.square(u) + np.square(v))
+    safe_norm = np.where(norm > 0.0, norm, 1.0)
+    return u / safe_norm * length, v / safe_norm * length
 
 
 def plot_slice(
@@ -68,13 +74,18 @@ def plot_slice(
     y += (extent[3] - extent[2]) / (2 * ny)
     xx, yy = np.meshgrid(x, y)
     stride = max(1, int(quiver_stride))
+    cell_width = (extent[1] - extent[0]) / nx
+    cell_height = (extent[3] - extent[2]) / ny
+    arrow_length = 0.75 * stride * min(cell_width, cell_height)
+    u_display, v_display = display_quiver_vectors(u, v, arrow_length)
 
     figure, axes = plt.subplots(figsize=(7.2, 6.0), constrained_layout=True)
     image = axes.imshow(plane_magnitude, origin="lower", extent=extent, aspect="equal", cmap="magma")
     axes.quiver(
         xx[::stride, ::stride], yy[::stride, ::stride],
-        u[::stride, ::stride], v[::stride, ::stride],
-        color="white", alpha=0.75, pivot="mid", scale=None,
+        u_display[::stride, ::stride], v_display[::stride, ::stride],
+        color="white", alpha=0.85, pivot="mid", angles="xy", scale_units="xy", scale=1,
+        width=0.0032, headwidth=4.2, headlength=5.0,
     )
     axes.set_xlabel(config["axes"][0])
     axes.set_ylabel(config["axes"][1])

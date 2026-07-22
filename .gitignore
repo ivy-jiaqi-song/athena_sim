@@ -6,6 +6,9 @@ configs/*.toml
 !configs/athenak-gpu-ma08.toml
 !configs/athenak-gpu-ma08-preflight-fp32.toml
 
+# Agent discussion
+task/
+
 # Disposable Athena++ build and simulation products.
 build/
 outputs/

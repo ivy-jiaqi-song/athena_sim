@@ -47,7 +47,7 @@ The AthenaK build verifies the external checkout revision and Kokkos submodule, 
 
 ## Configuration
 
-The tracked [example configuration](configs/example.toml) is a 256^3, 16-rank MPI case targeting moderately supersonic turbulence and $M_A\approx0.9$. Important controls are:
+The tracked [example configuration](configs/example.toml) is a $256^3$, 16-rank MPI case targeting moderately supersonic turbulence and $M_A \approx 0.9$. Important controls are:
 
 - `resolution` and `meshblock`: global and per-block cube dimensions.
 - `tlim`: simulation duration in code units.
@@ -77,31 +77,59 @@ Each run is written below `output_root/run_name/`. The default AthenaK name is s
 - `*.hst`: volume-averaged history.
 - `analysis/energy_history.png`: kinetic, fluctuating magnetic, turbulent, and total magnetic energy histories.
 - `analysis/diagnostics.csv`: scalar diagnostics by snapshot.
-- `analysis/diagnostics.json`: formulas, saturation assessment, $M_s$, two $M_A$ estimators, field statistics, plasma beta, and energies.
+- `analysis/diagnostics.json`: formulas, saturation assessment, $M_s$, two $M_A$ estimators, field statistics, plasma beta, target selection, and derived plot products.
 - `analysis/selected_snapshot/*.athdf`: the selected AthenaK snapshot retained for provenance.
 - `analysis/selected_snapshot/*.h5`: only the selected snapshot converted to contiguous cubes.
 - `analysis/bfield_slices/*.png`: three orthogonal magnetic slices from the selected snapshot.
-- `analysis/j_histograms/*.png`: $J=\nabla\times B$ component histograms from the selected snapshot.
+- `analysis/j_histograms/*.png`: $J = \nabla \times B$ component histograms from the selected snapshot.
 
 The primary definitions are
 
-\[
-M_s = \frac{v_{rms,\rho}}{c_s}, \qquad
-M_A = \frac{v_{rms,\rho}}{|\langle B\rangle|/\sqrt{\langle\rho\rangle}}, \qquad
-M_{A,B}=\frac{\delta B_{rms}}{|\langle B\rangle|}.
-\]
+$$
+M_s = \frac{v_{\mathrm{rms},\rho}}{c_s}
+$$
 
-The final 25% of usable history samples is the candidate saturation window. The pipeline requires less than 10% fitted turbulent-energy change there and at least `5 × tcorr` elapsed time. It considers only snapshots inside the accepted window and minimizes absolute target error, with later-time tie breaking and no target tolerance. `metric = "ms"` uses $M_s$; `metric = "ma"` uses $M_{A,B}$. If saturation is false or inconclusive, or if no snapshot is inside the window, analysis records the failure in `diagnostics.json` and exits without selected-snapshot conversion or magnetic-slice generation.
+$$
+M_A = \frac{v_{\mathrm{rms},\rho}}{|\langle B \rangle| / \sqrt{\langle \rho \rangle}}
+$$
 
-AthenaK diagnostics stream directly from every shared `.bin`; Athena++ diagnostics read `.athdf` directly. `run` writes solver output only. After selection, exactly one AthenaK `.bin` is atomically materialized as `.athdf`, retained for provenance, and converted to `.h5`. The explicit `convert` command reuses valid selection metadata or performs diagnostics and selection first. `all` executes `build → run → analyze`. AMR, sliced/ghost-zone output, and one-file-per-rank binaries are rejected.
+$$
+M_{A,B} = \frac{\delta B_{\mathrm{rms}}}{|\langle B \rangle|}
+$$
 
-The AthenaK mapping recorded in `solver_metadata.json` is explicit: `mode → turb_flag`, `energy_injection_rate → dedt`, `correlation_time → tcorr`, `drive_interval → dt_turb_update`, `solenoidal_fraction → sol_fraction`, `random_seed → random_seed`, and `spectrum_exponent → expo` with `spect_form = 2` and isotropic `driving_type = 0`.
+$M_s$ is the density-weighted turbulent rms velocity divided by the isothermal sound speed. $M_A$ compares the same turbulent velocity with the Alfven speed from the mean guide field. $M_{A,B}$ is the magnetic-fluctuation estimator; this is the value used when `selection.metric = "ma"`.
+
+### Target selection
+
+The final 25% of usable history samples is treated as the candidate saturation window. The pipeline accepts that window only when the fitted turbulent-energy drift is below 10% and the elapsed time is at least `5 * tcorr`. It then considers only snapshots whose times fall inside the accepted window.
+
+`selection.metric = "ms"` selects the eligible snapshot nearest the requested sonic Mach number. `selection.metric = "ma"` selects the eligible snapshot nearest the requested magnetic-fluctuation Alfvenic Mach number, $M_{A,B}$. If two snapshots have the same target error, the later snapshot wins. There is intentionally no target tolerance: the nearest accepted snapshot is selected and its absolute and fractional target error are written to `analysis/diagnostics.json`.
+
+If saturation is false or inconclusive, or if no snapshot is inside the window, analysis records the failure in `diagnostics.json` and exits without selected-snapshot conversion, magnetic slices, or J histograms.
+
+### Selected-snapshot plots
+
+After target selection, the pipeline converts exactly one selected snapshot to a contiguous `.h5` cube under `analysis/selected_snapshot/`. The magnetic-slice and J-histogram products are both derived from that same `.h5` file, so they correspond to the target snapshot recorded in `analysis/diagnostics.json`.
+
+`analysis/bfield_slices/` contains three midpoint planes: `bfield_b2b3.png`, `bfield_b1b3.png`, and `bfield_b1b2.png`. Each plot shows magnetic-field magnitude as the image layer and normalized in-plane magnetic-field direction as white arrows. The arrow density is controlled by `output.quiver_stride`.
+
+`analysis/j_histograms/jxyz_histogram.png` computes the current density spectrally as
+
+$$
+J = \nabla \times B
+$$
+
+and plots centered probability-density histograms for $J_x$, $J_y$, and $J_z$. Each panel subtracts its own mean, reports `mu` and `sigma`, and overlays a Gaussian reference with the same standard deviation. These histograms are intended as a quick intermittency and current-sheet diagnostic for the selected state, not as part of the target-selection criterion.
+
+AthenaK diagnostics stream directly from every shared `.bin`; Athena++ diagnostics read `.athdf` directly. `run` writes solver output only. After selection, exactly one AthenaK `.bin` is atomically materialized as `.athdf`, retained for provenance, and converted to `.h5`. The explicit `convert` command reuses valid selection metadata or performs diagnostics and selection first. `all` executes `build -> run -> analyze`. AMR, sliced/ghost-zone output, and one-file-per-rank binaries are rejected.
+
+The AthenaK mapping recorded in `solver_metadata.json` is explicit: `mode -> turb_flag`, `energy_injection_rate -> dedt`, `correlation_time -> tcorr`, `drive_interval -> dt_turb_update`, `solenoidal_fraction -> sol_fraction`, `random_seed -> random_seed`, and `spectrum_exponent -> expo` with `spect_form = 2` and isotropic `driving_type = 0`.
 
 Only tune $M_A$ from a run that the saturation diagnostic accepts. A useful next iteration is
 
-\[
-B_{0,new} \approx B_{0,old}\frac{M_{A,measured}}{M_{A,target}},
-\]
+$$
+B_{0,\mathrm{new}} \approx B_{0,\mathrm{old}} \frac{M_{A,\mathrm{measured}}}{M_{A,\mathrm{target}}}
+$$
 
 followed by a fresh run because magnetic tension changes the saturated velocity. Repeat at an affordable resolution before committing to $512^3$.
 

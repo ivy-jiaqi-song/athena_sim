@@ -47,7 +47,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     cfg["power_spectra"].setdefault("enabled", True)
     cfg["power_spectra"].setdefault("plot_k_min", 1)
     cfg["power_spectra"].setdefault("plot_k_max", 0)
-    cfg["power_spectra"].setdefault("fit_enabled", True)
+    cfg["power_spectra"].setdefault("fit_enabled", False)
     cfg["power_spectra"].setdefault("fit_k_min", 0)
     cfg["power_spectra"].setdefault("fit_k_max", 0)
     cfg["power_spectra"].setdefault("fit_magnetic_only", True)

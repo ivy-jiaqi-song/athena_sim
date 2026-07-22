@@ -88,7 +88,7 @@ enabled = true
 plot_k_min = 1
 # 0 means floor(min(Nx, Ny, Nz) / 3); for 512^3 this is 170.
 plot_k_max = 0
-fit_enabled = true
+fit_enabled = false
 fit_k_min = 0
 fit_k_max = 0
 fit_magnetic_only = true

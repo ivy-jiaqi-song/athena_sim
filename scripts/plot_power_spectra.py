@@ -344,8 +344,10 @@ def calculate_spectra(
     }
 
 
-def automatic_fit_min(forcing_nhigh: int) -> int:
-    return max(4, int(forcing_nhigh) + 2)
+def automatic_fit_limits(plot_k_max: int) -> tuple[int, int]:
+    fit_min = max(1, int(math.ceil(0.01 * float(plot_k_max))))
+    fit_max = max(fit_min + 1, int(math.floor(0.2 * float(plot_k_max))))
+    return fit_min, fit_max
 
 
 def resolve_limits(
@@ -359,8 +361,9 @@ def resolve_limits(
     nyquist = min(shape) // 2
     effective_plot_max = min(shape) // 3
     resolved_plot_max = effective_plot_max if int(plot_k_max) == 0 else int(plot_k_max)
-    resolved_fit_min = automatic_fit_min(forcing_nhigh) if int(fit_k_min) == 0 else int(fit_k_min)
-    resolved_fit_max = resolved_plot_max if int(fit_k_max) == 0 else int(fit_k_max)
+    automatic_min, automatic_max = automatic_fit_limits(resolved_plot_max)
+    resolved_fit_min = automatic_min if int(fit_k_min) == 0 else int(fit_k_min)
+    resolved_fit_max = automatic_max if int(fit_k_max) == 0 else int(fit_k_max)
     result = {
         "plot_k_min": int(plot_k_min),
         "plot_k_max": int(resolved_plot_max),
@@ -522,7 +525,7 @@ def write_outputs(
     *,
     plot_k_min: int = 1,
     plot_k_max: int = 0,
-    fit_enabled: bool = True,
+    fit_enabled: bool = False,
     fit_k_min: int = 0,
     fit_k_max: int = 0,
     min_fit_bins: int = 8,
@@ -560,9 +563,13 @@ def write_outputs(
         "stored_k_range": [0, result["metadata"]["stored_k_max"]],
         "effective_plot_k_max": limits["effective_plot_k_max"],
         "common_cartesian_nyquist": limits["common_cartesian_nyquist"],
-        "forcing_range_for_automatic_fit": {
+        "forcing_range": {
             "nlow": int(forcing_nlow), "nhigh": int(forcing_nhigh),
             "interpretation": "shared Athena++ exclusive bounds nlow < |k| < nhigh; AthenaK input translates to inclusive nlow+1, nhigh-1",
+        },
+        "automatic_fit_limit_definition": {
+            "fit_k_min": "max(1, ceil(0.01 * plot_k_max)) when configured as 0",
+            "fit_k_max": "max(fit_k_min + 1, floor(0.2 * plot_k_max)) when configured as 0",
         },
         "fit_configuration": {
             "fit_enabled": bool(fit_enabled), "fit_k_min": limits["fit_k_min"],
@@ -590,7 +597,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--plot-k-min", type=int, default=1)
     parser.add_argument("--plot-k-max", type=int, default=0)
-    parser.add_argument("--fit-enabled", choices=("true", "false"), default="true")
+    parser.add_argument("--fit-enabled", choices=("true", "false"), default="false")
     parser.add_argument("--fit-k-min", type=int, default=0)
     parser.add_argument("--fit-k-max", type=int, default=0)
     parser.add_argument("--min-fit-bins", type=int, default=8)

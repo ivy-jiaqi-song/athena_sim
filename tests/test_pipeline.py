@@ -62,7 +62,7 @@ def example_config(solver: str = "athena++"):
         },
         "power_spectra": {
             "enabled": True, "plot_k_min": 1, "plot_k_max": 0,
-            "fit_enabled": True, "fit_k_min": 0, "fit_k_max": 0,
+            "fit_enabled": False, "fit_k_min": 0, "fit_k_max": 0,
             "fit_magnetic_only": True, "min_fit_bins": 8,
             "parseval_rtol": 1.0e-5, "guide_alignment_tolerance": 1.0e-8,
             "save_full_nyquist_spectrum": True,
@@ -423,7 +423,14 @@ class PowerSpectrumTests(unittest.TestCase):
         self.assertEqual(fit["fit_k_max"], 9)
         limits = spectra.resolve_limits((512, 512, 512), 1, 0, 0, 0, 4)
         self.assertEqual(limits["plot_k_max"], 170)
+        self.assertEqual(limits["fit_k_min"], 2)
+        self.assertEqual(limits["fit_k_max"], 34)
         self.assertEqual(limits["common_cartesian_nyquist"], 256)
+
+    def test_explicit_fit_limits_override_automatic_limits(self):
+        limits = spectra.resolve_limits((512, 512, 512), 1, 0, 12, 80, 4)
+        self.assertEqual(limits["fit_k_min"], 12)
+        self.assertEqual(limits["fit_k_max"], 80)
 
     def test_invalid_fit_range_skips_fit(self):
         k = np.arange(0, 8)
@@ -450,6 +457,28 @@ class PowerSpectrumTests(unittest.TestCase):
             self.assertTrue(outputs["png"].is_file())
             self.assertTrue(outputs["csv"].is_file())
             self.assertTrue(outputs["json"].is_file())
+            metadata = __import__("json").loads(outputs["json"].read_text(encoding="utf-8"))
+            self.assertFalse(metadata["fit_configuration"]["fit_enabled"])
+            self.assertEqual(metadata["fits"]["magnetic"]["perpendicular"]["status"], "disabled")
+
+    def test_writes_enabled_fit_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shape = (32, 32, 32)
+            x = np.arange(shape[0])[:, None, None] / shape[0]
+            y = np.arange(shape[1])[None, :, None] / shape[1]
+            magnetic = [1.0 + np.sin(2.0 * np.pi * 2 * x) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            velocity = [np.sin(2.0 * np.pi * 3 * y) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            path = root / "snapshot.h5"
+            write_power_spectrum_fixture(path, shape=shape, velocity=velocity, magnetic=magnetic)
+            outputs = spectra.write_outputs(
+                path, root / "power_spectra", fit_enabled=True, fit_k_min=1,
+                fit_k_max=10, min_fit_bins=2,
+            )
+            metadata = __import__("json").loads(outputs["json"].read_text(encoding="utf-8"))
+            self.assertTrue(metadata["fit_configuration"]["fit_enabled"])
 
 
 class WorkflowControlTests(unittest.TestCase):

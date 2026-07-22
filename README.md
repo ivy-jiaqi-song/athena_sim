@@ -81,6 +81,7 @@ Each run is written below `output_root/run_name/`. The default AthenaK name is s
 - `analysis/selected_snapshot/*.athdf`: the selected AthenaK snapshot retained for provenance.
 - `analysis/selected_snapshot/*.h5`: only the selected snapshot converted to contiguous cubes.
 - `analysis/bfield_slices/*.png`: three orthogonal magnetic slices from the selected snapshot.
+- `analysis/j_histograms/*.png`: $J=\nabla\times B$ component histograms from the selected snapshot.
 
 The primary definitions are
 

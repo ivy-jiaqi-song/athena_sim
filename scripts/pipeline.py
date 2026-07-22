@@ -1240,6 +1240,7 @@ def postprocess_selected_snapshot(
     source_snapshot = run_dir / str(selection["snapshot"]["file"])
     converted_dir = analysis_dir / "selected_snapshot"
     bfield_dir = analysis_dir / "bfield_slices"
+    jhist_dir = analysis_dir / "j_histograms"
     converted_dir.mkdir(parents=True, exist_ok=True)
 
     if solver_name(cfg) == "athenak":
@@ -1260,6 +1261,7 @@ def postprocess_selected_snapshot(
 
     julia_script = ROOT / "scripts" / "ath2h5.jl"
     bfield_script = ROOT / "scripts" / "make_bfield_slices.py"
+    jhist_script = ROOT / "scripts" / "plot_jxyz_hist.py"
     run_backend(
         [
             str(cfg["execution"].get("julia_command", "julia")),
@@ -1282,11 +1284,22 @@ def postprocess_selected_snapshot(
         run_dir,
         cfg,
     )
+    run_backend(
+        [
+            str(cfg["execution"].get("python_command", "python3")),
+            backend_path(jhist_script, cfg),
+            "--input", backend_path(converted_path, cfg),
+            "--output-dir", backend_path(jhist_dir, cfg),
+        ],
+        run_dir,
+        cfg,
+    )
     return {
         "source_snapshot": str(source_snapshot),
         "selected_athdf": str(athdf_snapshot),
         "converted_snapshot": str(converted_path),
         "bfield_slice_directory": str(bfield_dir),
+        "j_histogram_directory": str(jhist_dir),
     }
 
 

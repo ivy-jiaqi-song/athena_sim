@@ -26,6 +26,7 @@ def load_module(name: str, path: Path):
 
 pipeline = load_module("pipeline", ROOT / "scripts" / "pipeline.py")
 bfield = load_module("make_bfield_slices", ROOT / "scripts" / "make_bfield_slices.py")
+jhist = load_module("plot_jxyz_hist", ROOT / "scripts" / "plot_jxyz_hist.py")
 converter = load_module("athenak_to_athdf", ROOT / "scripts" / "athenak_to_athdf.py")
 preflight = load_module("validate_ma08_preflight", ROOT / "scripts" / "validate_ma08_preflight.py")
 
@@ -271,6 +272,27 @@ class BFieldSliceTests(unittest.TestCase):
             self.assertTrue(all(path.is_file() for path in outputs))
 
 
+class JHistogramTests(unittest.TestCase):
+    def test_writes_histogram(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_path = root / "snapshot.h5"
+            x = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)[:, None, None]
+            y = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)[None, :, None]
+            z = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)[None, None, :]
+            with h5py.File(input_path, "w") as handle:
+                handle["i_mag_field"] = np.sin(y) + np.zeros((8, 8, 8))
+                handle["j_mag_field"] = np.cos(z) + np.zeros((8, 8, 8))
+                handle["k_mag_field"] = np.sin(x) + np.zeros((8, 8, 8))
+                handle["time"] = 2.5
+                handle["cycle"] = 12
+                handle["domain_bounds"] = [
+                    0.0, 2.0 * np.pi, 0.0, 2.0 * np.pi, 0.0, 2.0 * np.pi,
+                ]
+            output = jhist.plot_histogram(input_path, root / "j_histograms")
+            self.assertTrue(output.is_file())
+
+
 class WorkflowControlTests(unittest.TestCase):
     def test_convert_reuses_selected_metadata(self):
         cfg = example_config("athenak")
@@ -291,6 +313,7 @@ class WorkflowControlTests(unittest.TestCase):
                 "selected_athdf": str(analysis / "selected_snapshot" / "selected.athdf"),
                 "converted_snapshot": str(analysis / "selected_snapshot" / "selected.h5"),
                 "bfield_slice_directory": str(analysis / "bfield_slices"),
+                "j_histogram_directory": str(analysis / "j_histograms"),
             }
             with mock.patch.object(pipeline, "run_directory", return_value=run_dir), \
                  mock.patch.object(pipeline, "analyze") as analyze, \

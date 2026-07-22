@@ -43,6 +43,18 @@ def load_config(path: str | Path) -> dict[str, Any]:
         if section not in cfg:
             raise ValueError(f"Missing [{section}] in {config_path}")
     cfg["execution"].setdefault("solver", "athena++")
+    cfg.setdefault("power_spectra", {})
+    cfg["power_spectra"].setdefault("enabled", True)
+    cfg["power_spectra"].setdefault("plot_k_min", 1)
+    cfg["power_spectra"].setdefault("plot_k_max", 0)
+    cfg["power_spectra"].setdefault("fit_enabled", True)
+    cfg["power_spectra"].setdefault("fit_k_min", 0)
+    cfg["power_spectra"].setdefault("fit_k_max", 0)
+    cfg["power_spectra"].setdefault("fit_magnetic_only", True)
+    cfg["power_spectra"].setdefault("min_fit_bins", 8)
+    cfg["power_spectra"].setdefault("parseval_rtol", 1.0e-5)
+    cfg["power_spectra"].setdefault("guide_alignment_tolerance", 1.0e-8)
+    cfg["power_spectra"].setdefault("save_full_nyquist_spectrum", True)
     return cfg
 
 
@@ -437,6 +449,30 @@ def validate_simulation_config(cfg: dict[str, Any]) -> None:
     target = float(selection["target"])
     if not math.isfinite(target) or target <= 0.0:
         raise ValueError("selection.target must be a positive finite number")
+    spectra = cfg.get("power_spectra", {})
+    if spectra:
+        plot_k_min = int(spectra.get("plot_k_min", 1))
+        plot_k_max = int(spectra.get("plot_k_max", 0))
+        fit_k_min = int(spectra.get("fit_k_min", 0))
+        fit_k_max = int(spectra.get("fit_k_max", 0))
+        min_fit_bins = int(spectra.get("min_fit_bins", 8))
+        nyquist = n // 2
+        if plot_k_min < 1:
+            raise ValueError("power_spectra.plot_k_min must be >= 1")
+        if plot_k_max and not plot_k_min < plot_k_max <= nyquist:
+            raise ValueError("power_spectra.plot_k_max must be 0 or in (plot_k_min, N/2]")
+        if fit_k_min and fit_k_max and not fit_k_min < fit_k_max:
+            raise ValueError("power_spectra.fit_k_min must be < fit_k_max")
+        if min_fit_bins < 2:
+            raise ValueError("power_spectra.min_fit_bins must be >= 2")
+        parseval_rtol = float(spectra.get("parseval_rtol", 1.0e-5))
+        guide_tolerance = float(spectra.get("guide_alignment_tolerance", 1.0e-8))
+        if not math.isfinite(parseval_rtol) or parseval_rtol <= 0.0:
+            raise ValueError("power_spectra.parseval_rtol must be positive and finite")
+        if not math.isfinite(guide_tolerance) or guide_tolerance < 0.0:
+            raise ValueError("power_spectra.guide_alignment_tolerance must be finite and non-negative")
+        if spectra.get("fit_magnetic_only", True) is not True:
+            raise ValueError("power_spectra.fit_magnetic_only must remain true in this implementation")
     if solver == "athenak":
         if "athenak" not in cfg:
             raise ValueError("Missing [athenak] for the AthenaK solver")
@@ -1241,6 +1277,7 @@ def postprocess_selected_snapshot(
     converted_dir = analysis_dir / "selected_snapshot"
     bfield_dir = analysis_dir / "bfield_slices"
     jhist_dir = analysis_dir / "j_histograms"
+    spectra_dir = analysis_dir / "power_spectra"
     converted_dir.mkdir(parents=True, exist_ok=True)
 
     if solver_name(cfg) == "athenak":
@@ -1262,6 +1299,7 @@ def postprocess_selected_snapshot(
     julia_script = ROOT / "scripts" / "ath2h5.jl"
     bfield_script = ROOT / "scripts" / "make_bfield_slices.py"
     jhist_script = ROOT / "scripts" / "plot_jxyz_hist.py"
+    spectra_script = ROOT / "scripts" / "plot_power_spectra.py"
     run_backend(
         [
             str(cfg["execution"].get("julia_command", "julia")),
@@ -1294,12 +1332,43 @@ def postprocess_selected_snapshot(
         run_dir,
         cfg,
     )
+    spectra_products = {}
+    spectra_cfg = cfg.get("power_spectra", {})
+    if spectra_cfg.get("enabled", True):
+        run_backend(
+            [
+                str(cfg["execution"].get("python_command", "python3")),
+                backend_path(spectra_script, cfg),
+                "--input", backend_path(converted_path, cfg),
+                "--output-dir", backend_path(spectra_dir, cfg),
+                "--plot-k-min", str(int(spectra_cfg.get("plot_k_min", 1))),
+                "--plot-k-max", str(int(spectra_cfg.get("plot_k_max", 0))),
+                "--fit-enabled", "true" if spectra_cfg.get("fit_enabled", True) else "false",
+                "--fit-k-min", str(int(spectra_cfg.get("fit_k_min", 0))),
+                "--fit-k-max", str(int(spectra_cfg.get("fit_k_max", 0))),
+                "--min-fit-bins", str(int(spectra_cfg.get("min_fit_bins", 8))),
+                "--parseval-rtol", str(float(spectra_cfg.get("parseval_rtol", 1.0e-5))),
+                "--guide-alignment-tolerance",
+                str(float(spectra_cfg.get("guide_alignment_tolerance", 1.0e-8))),
+                "--forcing-nlow", str(int(cfg["forcing"]["nlow"])),
+                "--forcing-nhigh", str(int(cfg["forcing"]["nhigh"])),
+            ],
+            run_dir,
+            cfg,
+        )
+        spectra_products = {
+            "power_spectra_directory": str(spectra_dir),
+            "power_spectra_png": str(spectra_dir / "power_spectra_parallel_perpendicular.png"),
+            "power_spectra_csv": str(spectra_dir / "power_spectra_parallel_perpendicular.csv"),
+            "power_spectra_json": str(spectra_dir / "power_spectra_parallel_perpendicular.json"),
+        }
     return {
         "source_snapshot": str(source_snapshot),
         "selected_athdf": str(athdf_snapshot),
         "converted_snapshot": str(converted_path),
         "bfield_slice_directory": str(bfield_dir),
         "j_histogram_directory": str(jhist_dir),
+        **spectra_products,
     }
 
 

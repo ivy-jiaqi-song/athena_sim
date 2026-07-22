@@ -66,3 +66,16 @@ restart_interval = 1.0
 slice_axis = "x3"
 slice_index = -1
 quiver_stride = 8
+
+[power_spectra]
+enabled = true
+plot_k_min = 1
+plot_k_max = 0
+fit_enabled = true
+fit_k_min = 0
+fit_k_max = 0
+fit_magnetic_only = true
+min_fit_bins = 8
+parseval_rtol = 1.0e-5
+guide_alignment_tolerance = 1.0e-8
+save_full_nyquist_spectrum = true

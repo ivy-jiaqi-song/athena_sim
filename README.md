@@ -64,6 +64,7 @@ The tracked [example configuration](configs/example.toml) is a $256^3$, 16-rank 
 - `[athenak].integrator = "rk2"` and `reconstruction = "plm"`: the supported second-order counterparts to Athena++ `vl2` and second-order reconstruction.
 - AthenaK includes forcing-shell endpoints, so shared exclusive `forcing.nlow`/`nhigh` bounds are translated to `nlow + 1` and `nhigh - 1`; do not duplicate the band under `[athenak]`.
 - `execution.simulation_timeout`: optional process-group wall-time limit, capped at two hours. Timeout sends TERM, waits 30 seconds, then sends KILL while preserving partial output.
+- `[power_spectra]`: controls the selected-snapshot parallel/perpendicular spectra. Set `enabled = false` to skip the product. Zero-valued `plot_k_max`, `fit_k_min`, and `fit_k_max` request automatic limits.
 
 Athena++ distributes MeshBlocks across ranks and threads, so configure enough MeshBlocks to keep every worker occupied. The example uses 512 MeshBlocks, giving 32 blocks per rank with 16 MPI ranks.
 
@@ -82,6 +83,7 @@ Each run is written below `output_root/run_name/`. The default AthenaK name is s
 - `analysis/selected_snapshot/*.h5`: only the selected snapshot converted to contiguous cubes.
 - `analysis/bfield_slices/*.png`: three orthogonal magnetic slices from the selected snapshot.
 - `analysis/j_histograms/*.png`: $J = \nabla \times B$ component histograms from the selected snapshot.
+- `analysis/power_spectra/power_spectra_parallel_perpendicular.{png,csv,json}`: reduced magnetic and kinetic spectra parallel and perpendicular to the selected snapshot's mean magnetic field.
 
 The primary definitions are
 
@@ -121,6 +123,30 @@ $$
 
 and plots centered probability-density histograms for $J_x$, $J_y$, and $J_z$. Each panel subtracts its own mean, reports `mu` and `sigma`, and overlays a Gaussian reference with the same standard deviation. These histograms are intended as a quick intermittency and current-sheet diagnostic for the selected state, not as part of the target-selection criterion.
 
+`analysis/power_spectra/power_spectra_parallel_perpendicular.png` contains two log-log panels: reduced spectra perpendicular and parallel to the selected snapshot's mean guide field. The same selected contiguous `.h5` cube is used for density, velocity, and cell-centered magnetic field. The magnetic fluctuation is
+
+$$
+\delta B = B - \langle B \rangle
+$$
+
+and the kinetic spectral variable is density weighted,
+
+$$
+u_K = \sqrt{\rho}\left(v - \frac{\sum \rho v}{\sum \rho}\right).
+$$
+
+Mode powers use NumPy's full complex FFT with explicit normalization `fftn(field) / field.size`, so Parseval is checked as
+
+$$
+\sum_k P_B(k) = \frac{1}{2}\langle |\delta B|^2 \rangle,
+\quad
+\sum_k P_K(k) = \frac{1}{2}\langle \rho |\delta v|^2 \rangle.
+$$
+
+The reduced spectra are formed from all 3D Fourier modes, not from a line or slice. For the usual x1-aligned guide field, the parallel spectrum bins all modes by $|k_{x1}|$ and the perpendicular spectrum bins all modes by $\sqrt{k_{x2}^2 + k_{x3}^2}$. Bins are unit-width bins centered on positive integer dimensionless modes $kL/(2\pi)$. The plotted spectral density is summed mode energy per unit k-bin width; it is not mean power per Fourier mode. The CSV also includes `mode_count` and mean mode power diagnostics.
+
+Zero modes are excluded from the logarithmic plot and from power-law fits. By default, spectra are saved through the common Cartesian Nyquist limit `floor(min(Nx, Ny, Nz) / 2)`, while the PNG plots only through `floor(min(Nx, Ny, Nz) / 3)` to avoid the most dissipative high-k range. For $512^3$, these defaults are 256 stored and 170 plotted. Automatic magnetic fit limits start above the forcing band, using `max(4, forcing.nhigh + 2)` for the shared exclusive forcing-shell convention, and end at the plotted maximum. Vertical lines mark the exact fitted bins. Fit slopes depend on the chosen fit range, and high-k numerical dissipation limits physical interpretation.
+
 AthenaK diagnostics stream directly from every shared `.bin`; Athena++ diagnostics read `.athdf` directly. `run` writes solver output only. After selection, exactly one AthenaK `.bin` is atomically materialized as `.athdf`, retained for provenance, and converted to `.h5`. The explicit `convert` command reuses valid selection metadata or performs diagnostics and selection first. `all` executes `build -> run -> analyze`. AMR, sliced/ghost-zone output, and one-file-per-rank binaries are rejected.
 
 The AthenaK mapping recorded in `solver_metadata.json` is explicit: `mode -> turb_flag`, `energy_injection_rate -> dedt`, `correlation_time -> tcorr`, `drive_interval -> dt_turb_update`, `solenoidal_fraction -> sol_fraction`, `random_seed -> random_seed`, and `spectrum_exponent -> expo` with `spect_form = 2` and isotropic `driving_type = 0`.
@@ -135,7 +161,7 @@ followed by a fresh run because magnetic tension changes the saturated velocity.
 
 ## Production scale
 
-For $512^3$, plan on at least 64 GiB, preferably 128 GiB, distributed across MPI ranks. One uncompressed single-precision primitive snapshot is roughly 3.5-4 GiB, so output cadence must be chosen with storage limits in mind. The streaming analyzer reads one MeshBlock at a time for global diagnostics and only the intersecting blocks for a 2D slice.
+For $512^3$, plan on at least 64 GiB, preferably 128 GiB, distributed across MPI ranks. One uncompressed single-precision primitive snapshot is roughly 3.5-4 GiB, so output cadence must be chosen with storage limits in mind. The streaming analyzer reads one MeshBlock at a time for global diagnostics and only the intersecting blocks for a 2D slice. The selected-snapshot power-spectrum product is memory intensive because it FFTs the contiguous cube; it processes one vector component at a time and uses one full complex scalar FFT at a time rather than retaining all six component transforms.
 
 ## NVIDIA smoke test
 

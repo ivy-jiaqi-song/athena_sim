@@ -27,6 +27,7 @@ def load_module(name: str, path: Path):
 pipeline = load_module("pipeline", ROOT / "scripts" / "pipeline.py")
 bfield = load_module("make_bfield_slices", ROOT / "scripts" / "make_bfield_slices.py")
 jhist = load_module("plot_jxyz_hist", ROOT / "scripts" / "plot_jxyz_hist.py")
+spectra = load_module("plot_power_spectra", ROOT / "scripts" / "plot_power_spectra.py")
 converter = load_module("athenak_to_athdf", ROOT / "scripts" / "athenak_to_athdf.py")
 preflight = load_module("validate_ma08_preflight", ROOT / "scripts" / "validate_ma08_preflight.py")
 
@@ -58,6 +59,13 @@ def example_config(solver: str = "athena++"):
         "output": {
             "history_interval": 0.05, "snapshot_interval": 0.1,
             "restart_interval": 1.0,
+        },
+        "power_spectra": {
+            "enabled": True, "plot_k_min": 1, "plot_k_max": 0,
+            "fit_enabled": True, "fit_k_min": 0, "fit_k_max": 0,
+            "fit_magnetic_only": True, "min_fit_bins": 8,
+            "parseval_rtol": 1.0e-5, "guide_alignment_tolerance": 1.0e-8,
+            "save_full_nyquist_spectrum": True,
         },
         "athenak": {
             "revision": pipeline.ATHENAK_REVISION, "device": "cpu", "kokkos_arch": "",
@@ -97,6 +105,28 @@ def write_athenak_fixture(path: Path) -> list[np.ndarray]:
             stream.write(values.tobytes(order="C"))
             blocks.append(values)
     return blocks
+
+
+def write_power_spectrum_fixture(path: Path, *, shape=(16, 16, 16), rho=None,
+                                 velocity=None, magnetic=None):
+    if rho is None:
+        rho = np.ones(shape)
+    if velocity is None:
+        velocity = [np.zeros(shape), np.zeros(shape), np.zeros(shape)]
+    if magnetic is None:
+        magnetic = [np.ones(shape), np.zeros(shape), np.zeros(shape)]
+    with h5py.File(path, "w") as handle:
+        handle["gas_density"] = rho
+        handle["i_velocity"] = velocity[0]
+        handle["j_velocity"] = velocity[1]
+        handle["k_velocity"] = velocity[2]
+        handle["i_mag_field"] = magnetic[0]
+        handle["j_mag_field"] = magnetic[1]
+        handle["k_mag_field"] = magnetic[2]
+        handle["time"] = 2.5
+        handle["cycle"] = 12
+        handle["domain_bounds"] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+        handle.attrs["array_axis_order"] = "x1,x2,x3"
 
 
 class SolverDispatchTests(unittest.TestCase):
@@ -293,6 +323,135 @@ class JHistogramTests(unittest.TestCase):
             self.assertTrue(output.is_file())
 
 
+class PowerSpectrumTests(unittest.TestCase):
+    def test_single_parallel_magnetic_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shape = (16, 16, 16)
+            x = np.arange(shape[0])[:, None, None] / shape[0]
+            magnetic = [1.0 + np.sin(2.0 * np.pi * 2 * x) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            path = root / "snapshot.h5"
+            write_power_spectrum_fixture(path, shape=shape, magnetic=magnetic)
+            result = spectra.calculate_spectra(path)
+            self.assertGreater(result["spectral_density"]["parallel_magnetic"][2], 0.24)
+            self.assertGreater(result["spectral_density"]["perpendicular_magnetic"][0], 0.24)
+            self.assertLess(result["spectral_density"]["perpendicular_magnetic"][1:].sum(), 1.0e-12)
+            self.assertLess(result["metadata"]["parseval"]["magnetic_relative_error"], 1.0e-12)
+
+    def test_single_perpendicular_and_oblique_magnetic_modes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shape = (16, 16, 16)
+            x = np.arange(shape[0])[:, None, None] / shape[0]
+            y = np.arange(shape[1])[None, :, None] / shape[1]
+            path = root / "snapshot.h5"
+
+            magnetic = [1.0 + np.sin(2.0 * np.pi * 3 * y) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            write_power_spectrum_fixture(path, shape=shape, magnetic=magnetic)
+            result = spectra.calculate_spectra(path)
+            self.assertGreater(result["spectral_density"]["perpendicular_magnetic"][3], 0.24)
+            self.assertGreater(result["spectral_density"]["parallel_magnetic"][0], 0.24)
+            self.assertLess(result["spectral_density"]["parallel_magnetic"][1:].sum(), 1.0e-12)
+
+            magnetic = [1.0 + np.sin(2.0 * np.pi * (2 * x + 3 * y)) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            write_power_spectrum_fixture(path, shape=shape, magnetic=magnetic)
+            result = spectra.calculate_spectra(path)
+            self.assertGreater(result["spectral_density"]["parallel_magnetic"][2], 0.24)
+            self.assertGreater(result["spectral_density"]["perpendicular_magnetic"][3], 0.24)
+
+    def test_mean_subtraction_velocity_weighting_and_parseval(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shape = (16, 16, 16)
+            x = np.arange(shape[0])[:, None, None] / shape[0]
+            rho = np.full(shape, 4.0)
+            velocity = [1.0 + np.sin(2.0 * np.pi * 2 * x) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            magnetic = [np.ones(shape), np.zeros(shape), np.zeros(shape)]
+            path = root / "snapshot.h5"
+            write_power_spectrum_fixture(path, shape=shape, rho=rho, velocity=velocity, magnetic=magnetic)
+            result = spectra.calculate_spectra(path)
+            self.assertLess(result["spectral_density"]["parallel_magnetic"].sum(), 1.0e-12)
+            self.assertAlmostEqual(result["spectral_density"]["parallel_kinetic"][2], 1.0)
+            self.assertAlmostEqual(result["metadata"]["parseval"]["kinetic_real_space_energy"], 1.0)
+            self.assertLess(result["metadata"]["parseval"]["kinetic_relative_error"], 1.0e-12)
+
+    def test_projected_oblique_guide_field_bins_modes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shape = (16, 16, 16)
+            x = np.arange(shape[0])[:, None, None] / shape[0]
+            y = np.arange(shape[1])[None, :, None] / shape[1]
+            magnetic = [1.0 + np.sin(2.0 * np.pi * (2 * x + 2 * y)) + np.zeros(shape),
+                        np.ones(shape), np.zeros(shape)]
+            path = root / "snapshot.h5"
+            write_power_spectrum_fixture(path, shape=shape, magnetic=magnetic)
+            result = spectra.calculate_spectra(path)
+            self.assertEqual(result["metadata"]["guide_alignment_method"], "projected_mean_field")
+            self.assertGreater(result["spectral_density"]["parallel_magnetic"][3], 0.24)
+            self.assertGreater(result["spectral_density"]["perpendicular_magnetic"][0], 0.24)
+
+    def test_spectral_density_is_not_divided_by_mode_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shape = (16, 16, 16)
+            y = np.arange(shape[1])[None, :, None] / shape[1]
+            z = np.arange(shape[2])[None, None, :] / shape[2]
+            magnetic = [1.0 + np.sin(2.0 * np.pi * 3 * y) + np.sin(2.0 * np.pi * 3 * z) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            path = root / "snapshot.h5"
+            write_power_spectrum_fixture(path, shape=shape, magnetic=magnetic)
+            result = spectra.calculate_spectra(path)
+            density = result["spectral_density"]["perpendicular_magnetic"][3]
+            count = result["mode_count"]["perpendicular"][3]
+            mean = result["mean_mode_power"]["perpendicular_magnetic"][3]
+            self.assertGreater(count, 1)
+            self.assertAlmostEqual(density, mean * count)
+
+    def test_power_law_fit_and_resolution_limits(self):
+        k = np.arange(0, 16)
+        spectrum = np.zeros_like(k, dtype=float)
+        spectrum[2:10] = 3.0 * np.power(k[2:10], -5.0 / 3.0)
+        counts = np.ones_like(k)
+        fit = spectra.fit_power_law(k, spectrum, counts, 2, 9, 5)
+        self.assertEqual(fit["status"], "ok")
+        self.assertAlmostEqual(fit["slope"], -5.0 / 3.0)
+        self.assertEqual(fit["fit_k_min"], 2)
+        self.assertEqual(fit["fit_k_max"], 9)
+        limits = spectra.resolve_limits((512, 512, 512), 1, 0, 0, 0, 4)
+        self.assertEqual(limits["plot_k_max"], 170)
+        self.assertEqual(limits["common_cartesian_nyquist"], 256)
+
+    def test_invalid_fit_range_skips_fit(self):
+        k = np.arange(0, 8)
+        spectrum = np.zeros_like(k, dtype=float)
+        spectrum[2] = 1.0
+        counts = np.ones_like(k)
+        fit = spectra.fit_power_law(k, spectrum, counts, 2, 5, 3)
+        self.assertEqual(fit["status"], "skipped")
+        self.assertIn("too few", fit["warning"])
+
+    def test_writes_power_spectrum_products(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shape = (16, 16, 16)
+            x = np.arange(shape[0])[:, None, None] / shape[0]
+            y = np.arange(shape[1])[None, :, None] / shape[1]
+            magnetic = [1.0 + np.sin(2.0 * np.pi * 2 * x) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            velocity = [np.sin(2.0 * np.pi * 3 * y) + np.zeros(shape),
+                        np.zeros(shape), np.zeros(shape)]
+            path = root / "snapshot.h5"
+            write_power_spectrum_fixture(path, shape=shape, velocity=velocity, magnetic=magnetic)
+            outputs = spectra.write_outputs(path, root / "power_spectra", min_fit_bins=2)
+            self.assertTrue(outputs["png"].is_file())
+            self.assertTrue(outputs["csv"].is_file())
+            self.assertTrue(outputs["json"].is_file())
+
+
 class WorkflowControlTests(unittest.TestCase):
     def test_convert_reuses_selected_metadata(self):
         cfg = example_config("athenak")
@@ -324,6 +483,24 @@ class WorkflowControlTests(unittest.TestCase):
             analyze.assert_not_called()
             postprocess.assert_called_once()
             self.assertIn(Path(products["selected_athdf"]), outputs)
+
+    def test_postprocess_runs_power_spectra_on_selected_cube_once(self):
+        cfg = example_config()
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            source = run_dir / "selected.athdf"
+            source.write_text("placeholder", encoding="utf-8")
+            analysis = run_dir / "analysis"
+            selection = {"snapshot": {"file": "selected.athdf", "time": 1.0}}
+            with mock.patch.object(pipeline, "run_backend") as run_backend:
+                products = pipeline.postprocess_selected_snapshot(cfg, run_dir, analysis, selection)
+            commands = [call.args[0] for call in run_backend.call_args_list]
+            spectra_commands = [command for command in commands if "plot_power_spectra.py" in command[1]]
+            self.assertEqual(len(spectra_commands), 1)
+            self.assertIn(str(analysis / "selected_snapshot" / "selected.h5"), spectra_commands[0])
+            self.assertEqual(products["power_spectra_directory"], str(analysis / "power_spectra"))
+            self.assertEqual(products["bfield_slice_directory"], str(analysis / "bfield_slices"))
+            self.assertEqual(products["j_histogram_directory"], str(analysis / "j_histograms"))
 
     def test_timeout_reaps_process_and_preserves_clear_error(self):
         cfg = example_config()
